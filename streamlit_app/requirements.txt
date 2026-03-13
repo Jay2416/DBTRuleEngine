@@ -1,0 +1,8 @@
+streamlit
+pandas
+pyhive[hive]
+thrift
+sasl
+thrift-sasl
+requests
+boto3

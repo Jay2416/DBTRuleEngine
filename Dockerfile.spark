@@ -1,0 +1,14 @@
+FROM apache/spark:3.4.1
+
+USER root
+
+# Download the required JARs directly to the Spark jars directory
+# 1. Iceberg Runtime
+ADD https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.4_2.12/1.4.3/iceberg-spark-runtime-3.4_2.12-1.4.3.jar /opt/spark/jars/
+# 2. Hadoop AWS
+ADD https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar /opt/spark/jars/
+# 3. AWS Java SDK Bundle
+ADD https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar /opt/spark/jars/
+
+# Ensure the JARs are readable
+RUN chmod 644 /opt/spark/jars/*.jar

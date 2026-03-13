@@ -1,0 +1,10 @@
+formula1:
+  outputs:
+    dev:
+      host: spark-thrift
+      method: thrift
+      port: 10000
+      schema: default
+      threads: 4
+      type: spark
+  target: dev

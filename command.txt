@@ -1,0 +1,15 @@
+BEELINE: docker exec -it spark-thrift /opt/spark/bin/beeline -u jdbc:hive2://localhost:10000
+
+DBT: docker exec -it dbt bash
+
+UP: docker compose up -d --build
+
+DOWN: docker compose down
+
+SPARK MASTER: docker exec -it spark-master bash
+
+
+
+
+
+--conf spark.sql.defaultCatalog=f1_catalog

@@ -1,0 +1,24 @@
+# IDE and System Files
+.vscode/
+__pycache__/
+*.pyc
+.DS_Store
+
+# dbt specific (ignores these folders in ANY sub-directory like netflix, formula1, etc.)
+**/target/
+**/dbt_packages/
+**/dbt_internal_packages/
+**/logs/
+
+# dbt profiles and local user configs (keeps your database credentials safe)
+.dbt/
+dbt/.user.yml
+
+# Python/Streamlit environments & secrets
+.env
+venv/
+.venv/
+.pytest_cache/
+
+# Local Data Volumes (assuming dremio_data holds local container data)
+dremio_data/

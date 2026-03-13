@@ -1,0 +1,493 @@
+# ============================================================================
+# DBT + APACHE SPARK THRIFT CONNECTION SETUP
+# ============================================================================
+
+## CONNECTION DETAILS
+- **Host**: spark-thrift (Docker container service name)
+- **Port**: 10000 (Spark Thrift Server)
+- **Catalog**: my_catalog
+- **Schema**: analytics
+- **Method**: Thrift Protocol
+- **DBT Adapter**: dbt-spark (version 1.5.2)
+
+## DIRECTORY STRUCTURE
+```
+.
+├── .dbt/
+│   └── profiles.yml                 # DBT connection configuration
+├── dbt/
+│   ├── Dockerfile                   # DBT container image
+│   ├── dbt_project.yml              # DBT project configuration
+│   ├── models/
+│   │   └── example_model.sql        # Sample model to test connection
+│   └── seeds/                       (optional)
+│   └── tests/                       (optional)
+├── docker-compose.yml               # Docker Compose configuration
+└── code.txt                         # This file
+
+## QUICK START
+
+1. Start all services:
+   docker-compose up -d
+
+2. Access dbt container:
+   docker-compose exec dbt bash
+
+3. Test connection:
+   dbt debug
+
+4. Run dbt models:
+   dbt run
+
+5. View dbt documentation:
+   dbt docs generate
+   dbt docs serve
+
+## DBT PROFILES CONFIGURATION
+Location: .dbt/profiles.yml
+
+```yaml
+analytics_profile:
+  outputs:
+    spark_thrift:
+      type: spark
+      method: thrift
+      schema: analytics
+      catalog: my_catalog
+      host: spark-thrift
+      port: 10000
+      user: root
+      threads: 4
+      timeout_seconds: 300
+      retries: 3
+  target: spark_thrift
+```
+
+## WRITING SQL MODELS
+Example: dbt/models/my_model.sql
+
+```sql
+{{ config(
+    materialized='view',
+    catalog='my_catalog',
+    schema='analytics'
+) }}
+
+select 
+    *
+from my_catalog.analytics.source_table
+where year = 2024
+```
+
+## COMMON DBT COMMANDS
+
+# Parse project (validates structure)
+dbt parse
+
+# Run models
+dbt run
+
+# Run specific model
+dbt run --select my_model
+
+# Generate and serve docs
+dbt docs generate
+dbt docs serve
+
+# Test models
+dbt test
+
+# Full refresh
+dbt run --full-refresh
+
+# Debug connection
+dbt debug
+
+## QUERY ANALYTICS SCHEMA IN DBT
+
+Access your existing analytics schema tables:
+
+```sql
+-- In your dbt models
+select * from my_catalog.analytics.your_table_name
+```
+
+## TROUBLESHOOTING
+
+### Test Spark Thrift Connection
+docker exec spark-thrift spark-sql -e "SHOW CATALOGS"
+
+### Check if Thrift Server is listening
+docker exec spark-thrift netstat -tuln | grep 10000
+
+### View Spark Logs
+docker logs spark-thrift
+
+### View DBT Logs
+docker logs dbt
+docker-compose exec dbt bash
+  # Inside container
+  cat logs/*
+
+## REFERENCE
+
+
+
+
+
+
+
+  spark-thrift:
+    image: apache/spark:3.4.1
+    container_name: spark-thrift
+    user: root
+    depends_on:
+      - spark-master
+    volumes:
+      # Mount a temp volume for JAR downloads so restarts are faster
+      - spark-ivy-cache:/tmp/.ivy2
+    command: >
+      /opt/spark/bin/spark-submit
+      --packages org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.3,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.jars.ivy=/tmp/.ivy2
+      --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      --master spark://spark-master:7077
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      --conf spark.sql.catalog.raw_data=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.raw_data.type=hadoop
+      --conf spark.sql.catalog.raw_data.warehouse=s3a://dmart/
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=admin
+      --conf spark.hadoop.fs.s3a.secret.key=password123
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      --conf hive.server2.thrift.bind.host=0.0.0.0
+      --conf hive.server2.thrift.port=10000
+    ports:
+      - "10000:10000"
+
+
+
+
+
+
+
+
+
+
+
+
+
+spark-thrift:
+    image: apache/spark:3.4.1
+    container_name: spark-thrift
+    user: root
+    depends_on:
+      - spark-master
+      - minio
+    ports:
+      - "10000:10000"
+    environment:
+      SPARK_HOME: /opt/spark
+    # We use a shell command to download JARs first, then start the server
+    entrypoint: /bin/bash
+    command: >
+      -c "
+      echo 'Downloading Iceberg and AWS dependencies...' &&
+      curl -s -L -o /opt/spark/jars/iceberg-spark-runtime-3.4_2.12-1.4.3.jar https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.4_2.12/1.4.3/iceberg-spark-runtime-3.4_2.12-1.4.3.jar &&
+      curl -s -L -o /opt/spark/jars/hadoop-aws-3.3.4.jar https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar &&
+      curl -s -L -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar &&
+      echo 'Dependencies downloaded. Starting Thrift Server...' &&
+      /opt/spark/bin/spark-submit \
+      --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 \
+      --master spark://spark-master:7077 \
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+      --conf spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog \
+      --conf spark.sql.catalog.my_catalog.type=hadoop \
+      --conf spark.sql.catalog.my_catalog.warehouse=s3a://dmart/ \
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+      --conf spark.hadoop.fs.s3a.access.key=admin \
+      --conf spark.hadoop.fs.s3a.secret.key=password123 \
+      --conf spark.hadoop.fs.s3a.path.style.access=true \
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
+      --conf spark.hadoop.hive.server2.thrift.bind.host=0.0.0.0 \
+      --conf spark.hadoop.hive.server2.thrift.port=10000
+      "
+
+
+
+
+
+
+
+
+
+
+ERRORLESS
+
+spark-thrift:
+    image: apache/spark:3.4.1
+    user: root
+    container_name: spark-thrift
+    depends_on:
+      - spark-master
+      - minio
+    ports:
+      - "10000:10000"  # JDBC Port
+      - "4040:4040"    # Spark UI
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password123
+      - AWS_REGION=us-east-1
+    volumes:
+       # Mounts your config
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+       # Persists downloaded JARs (prevents re-downloading every time)
+      - spark-ivy-cache:/root/.ivy2
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --deploy-mode client
+      --driver-memory 1g
+      --executor-memory 1g
+      --packages org.apache.iceberg:iceberg-spark-runtime-3.4_2.12:1.4.2,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+      --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      --conf spark.sql.catalog.dmart=org.apache.iceberg.spark.SparkCatalog
+      --conf spark.sql.catalog.dmart.type=hadoop
+      --conf spark.sql.catalog.dmart.warehouse=s3a://dmart/iceberg_data/
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=admin
+      --conf spark.hadoop.fs.s3a.secret.key=password123
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.hive.server2.thrift.bind.host=0.0.0.0
+      --conf spark.hive.server2.transport.mode=binary
+      --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+version: "3.9"
+
+services:
+  # -------------------- Spark Master --------------------
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - iceberg_net
+
+  # -------------------- Spark Worker 1 --------------------
+  spark-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker-1
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - iceberg_net
+
+  # -------------------- Spark Worker 2 --------------------
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark  # Uses the file we created above
+    container_name: spark-worker-2
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - iceberg_net
+
+  # -------------------- Spark Thrift Server (THE FIX) --------------------
+  # -------------------- Spark Thrift Server --------------------
+  spark-thrift:
+      build: 
+        context: .
+        dockerfile: Dockerfile.spark  # Uses the file we created above
+      user: root
+      container_name: spark-thrift
+      depends_on:
+        - spark-master
+        - minio
+      ports:
+        - "10000:10000"
+        - "4040:4040"
+      environment:
+        - AWS_ACCESS_KEY_ID=admin
+        - AWS_SECRET_ACCESS_KEY=password123
+        - AWS_REGION=us-east-1
+      networks:
+        - iceberg_net
+      volumes:
+        - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+        # We don't need the ivy-cache volume anymore
+      command: >
+        /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --deploy-mode client
+        --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+        --conf spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog
+        --conf spark.sql.catalog.my_catalog.type=hadoop
+        --conf spark.sql.catalog.my_catalog.warehouse=s3a://dmart/iceberg_data/
+        --conf spark.sql.catalog.school_catalog=org.apache.iceberg.spark.SparkCatalog
+        --conf spark.sql.catalog.school_catalog.type=hadoop
+        --conf spark.sql.catalog.school_catalog.warehouse=s3a://cygnet/iceberg_data/
+        --conf spark.sql.defaultCatalog=school_catalog
+        --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+        --conf spark.hadoop.fs.s3a.access.key=admin
+        --conf spark.hadoop.fs.s3a.secret.key=password123
+        --conf spark.hadoop.fs.s3a.path.style.access=true
+        --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+        --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        --conf spark.hive.server2.thrift.bind.host=0.0.0.0
+        --conf spark.hive.server2.transport.mode=binary
+        --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+        spark-internal
+
+  # -------------------- dbt --------------------
+  dbt:
+    build: ./dbt  # Uses your custom Dockerfile
+    container_name: dbt
+    depends_on:
+      - spark-thrift
+    volumes:
+      - ./dbt:/usr/app/dbt
+      - ./.dbt:/root/.dbt
+    tty: true
+    networks:
+      - iceberg_net
+
+  # -------------------- MinIO --------------------
+  minio:
+    image: minio/minio
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password123
+    volumes:
+      - minio-data:/data
+    networks:
+      - iceberg_net
+
+  # -------------------- Dremio --------------------
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    environment:
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+    volumes:
+      - ./dremio_data:/opt/dremio/data
+    ports:
+      - "9047:9047"
+      - "31010:31010"
+    networks:
+      - iceberg_net
+    depends_on:
+      - minio
+
+
+  # -------------------- Streamlit UI --------------------
+  streamlit-ui:
+    build: ./streamlit_app
+    container_name: streamlit-ui
+    ports:
+      - "8501:8501"
+    depends_on:
+      - spark-thrift
+      - dremio
+    volumes:
+      # Mounts your local folder so changes to app.py reflect instantly in the browser
+      - ./streamlit_app:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - iceberg_net
+    
+networks:
+  iceberg_net:
+    driver: bridge
+
+volumes:
+  minio-data:
+  spark-ivy-cache:

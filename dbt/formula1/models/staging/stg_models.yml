@@ -1,0 +1,149 @@
+version: 2
+
+models:
+  # --- DIMENSION TABLES ---
+  - name: stg_drivers
+    description: "Staging model for F1 drivers dimension."
+    columns:
+      - name: driver_id
+        description: "Primary Key - Unique driver identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_constructors
+    description: "Staging model for F1 constructors/teams dimension."
+    columns:
+      - name: constructor_id
+        description: "Primary Key - Unique constructor identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_circuits
+    description: "Staging model for F1 circuits dimension."
+    columns:
+      - name: circuit_id
+        description: "Primary Key - Unique circuit identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_seasons
+    description: "Staging model for F1 seasons dimension."
+    columns:
+      - name: season_year
+        description: "Primary Key - Year of the season."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_status
+    description: "Staging model for race status definitions."
+    columns:
+      - name: status_id
+        description: "Primary Key - Unique status identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_races
+    description: "Staging model for F1 races dimension."
+    columns:
+      - name: race_id
+        description: "Primary Key - Unique race identifier."
+        tests:
+          - unique
+          - not_null
+
+  # --- FACT TABLES ---
+  - name: stg_results
+    description: "Staging model for core race results fact table."
+    columns:
+      - name: result_id
+        description: "Primary Key - Unique result identifier."
+        tests:
+          - unique
+          - not_null
+      - name: race_id
+        tests:
+          - not_null
+
+  - name: stg_qualifying
+    description: "Staging model for qualifying session results."
+    columns:
+      - name: qualify_id
+        description: "Primary Key - Unique qualifying result identifier."
+        tests:
+          - unique
+          - not_null
+      - name: race_id
+        tests:
+          - not_null
+
+  - name: stg_sprint_results
+    description: "Staging model for sprint race results."
+    columns:
+      - name: sprint_result_id
+        description: "Primary Key - Unique sprint result identifier."
+        tests:
+          - unique
+          - not_null
+      - name: race_id
+        tests:
+          - not_null
+
+  # --- FACT TABLES (COMPOSITE KEYS) ---
+  - name: stg_lap_times
+    description: "Staging model for lap-by-lap data. Uses a composite key of race_id, driver_id, and lap_number."
+    columns:
+      - name: race_id
+        tests:
+          - not_null
+      - name: driver_id
+        tests:
+          - not_null
+      - name: lap_number
+        tests:
+          - not_null
+
+  - name: stg_pit_stops
+    description: "Staging model for pit stop data. Uses a composite key of race_id, driver_id, and pit_stop_number."
+    columns:
+      - name: race_id
+        tests:
+          - not_null
+      - name: driver_id
+        tests:
+          - not_null
+      - name: pit_stop_number
+        tests:
+          - not_null
+
+  # --- SLOWLY CHANGING DIMENSIONS & BRIDGE TABLES ---
+  - name: stg_driver_standings
+    description: "Staging model tracking driver championship standings after each race."
+    columns:
+      - name: driver_standings_id
+        description: "Primary Key - Unique driver standings record identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_constructor_standings
+    description: "Staging model tracking constructor championship standings after each race."
+    columns:
+      - name: constructor_standings_id
+        description: "Primary Key - Unique constructor standings record identifier."
+        tests:
+          - unique
+          - not_null
+
+  - name: stg_constructor_results
+    description: "Staging model for constructor points scored per race."
+    columns:
+      - name: constructor_results_id
+        description: "Primary Key - Unique constructor result identifier."
+        tests:
+          - unique
+          - not_null

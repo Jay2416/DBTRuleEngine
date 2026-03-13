@@ -1,0 +1,38 @@
+{
+    "primary_table": "stg_drivers",
+    "cols_t1": [
+        "first_name",
+        "last_name",
+        "date_of_birth"
+    ],
+    "cols_joins": {},
+    "joins": [],
+    "where_filters": [
+        {
+            "id": "93493fff-eab7-4745-8b83-a1c8d16e86d0",
+            "col": "",
+            "op": "equals (=)",
+            "val": "",
+            "logic": "AND",
+            "val2": ""
+        }
+    ],
+    "order_filters": [
+        {
+            "id": "04cf0ae4-4562-4300-86f9-c61d17759aee",
+            "col": "stg_drivers.date_of_birth",
+            "dir": "DESC"
+        }
+    ],
+    "group_cols": [],
+    "having_filters": [
+        {
+            "id": "5002f623-ae21-4168-9ece-dfa0f730bfef",
+            "agg": "COUNT",
+            "col": "",
+            "op": "equals (=)",
+            "val": "",
+            "logic": "AND"
+        }
+    ]
+}

@@ -1,0 +1,10 @@
+my_shop:
+  outputs:
+    dev:
+      host: spark-thrift
+      method: thrift
+      port: 10000
+      schema: analytics
+      threads: 4
+      type: spark
+  target: dev
