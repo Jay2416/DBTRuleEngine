@@ -1,0 +1,45 @@
+{
+    "primary_table": "stg_drivers",
+    "primary_columns": [
+        "driver_id",
+        "driver_ref",
+        "driver_number"
+    ],
+    "joins": [
+        {
+            "id": "fce7f92d-4fab-40ca-aec3-0b210a1033d1",
+            "right_table": "stg_results",
+            "join_type": "INNER JOIN",
+            "left_table": "stg_drivers",
+            "left_col": "driver_id",
+            "right_col": "driver_id"
+        }
+    ],
+    "cols_joins": {
+        "stg_results": [
+            "car_number",
+            "finishing_position"
+        ]
+    },
+    "aggregations": [],
+    "having_filters": [],
+    "manual_group_by": [],
+    "row_limit": 50,
+    "where_filters": [
+        {
+            "id": "ddfbdbb3-fa30-43ee-9ed7-d90dc12fbf52",
+            "col": "stg_drivers.driver_number",
+            "op": "IS NOT NULL",
+            "val": "",
+            "logic": "AND",
+            "val2": ""
+        }
+    ],
+    "order_filters": [
+        {
+            "id": "47a85e38-d375-40c0-b0c4-e8186255f622",
+            "col": "",
+            "dir": "ASC"
+        }
+    ]
+}
