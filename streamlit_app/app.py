@@ -465,6 +465,12 @@ def load_rule_state(rule_name):
             if func_val in agg_func_options: st.session_state[f"agg_func_{uid}"] = func_val
             if agg_data.get("alias"): st.session_state[f"agg_alias_{uid}"] = agg_data["alias"]
         
+        # Step 11: Load Execution Strategy into Session State
+        st.session_state.execution_mode = state.get("execution_mode", "non_sequential")
+        st.session_state.materialization = state.get("materialization", "table")
+        st.session_state.sequence_order = state.get("sequence_order", 1)
+        st.session_state.parent_rule_id = state.get("parent_rule_id", "NULL")
+        
         return True
     return False
 
@@ -540,17 +546,26 @@ def process_approval(approval_id, rule_id, rule_name, level_id, user_id, action,
             # Level 3 (SME) approved it -> Rule is now ACTIVE
             run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE' WHERE rule_id = {rule_id}")
             
-            # Step 1: Create the file
+            # Step 1: Create the final file in the /final_rules directory
             success_copy, copy_msg = create_final_rule_file(rule_name)
+            
             if success_copy:
-                # Step 2: Execute it via Docker
-                success_exec, exec_msg = execute_dbt_rule(rule_name)
-                if success_exec:
-                    return True, f"Rule is ACTIVE and executed! {exec_msg}"
+                # --- NEW LOGIC: Check materialization before executing ---
+                sql_content = read_dbt_sql(rule_name)
+                
+                # If it's an intermediate CTE step, do NOT execute Docker
+                if "materialized='ephemeral'" in sql_content or 'materialized="ephemeral"' in sql_content:
+                    return True, f"✅ Rule ACTIVE. Saved as Ephemeral CTE. Execution skipped until the final rule is run."
+                
+                # If it's a table/view, execute it
                 else:
-                    return False, f"Rule ACTIVE, file created, but execution failed: {exec_msg}"
+                    success_exec, exec_msg = execute_dbt_rule(rule_name)
+                    if success_exec:
+                        return True, f"✅ Rule is ACTIVE and executed! {exec_msg}"
+                    else:
+                        return False, f"⚠️ Rule ACTIVE, file created, but execution failed: {exec_msg}"
             else:
-                return False, f"Rule ACTIVE, but file copy failed: {copy_msg}"
+                return False, f"❌ Rule ACTIVE, but file copy failed: {copy_msg}"
             
     return True, "Processed."
 
@@ -602,9 +617,19 @@ def execute_dbt_rule(rule_name):
     """Executes the finalized rule via Docker exec from within the Streamlit container."""
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
     
+    # --- NEW: Check execution mode from database ---
+    mode_sql = f"SELECT execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE rule_name = '{rule_name}'"
+    mode_result = run_query(mode_sql)
+    
+    execution_mode = "non_sequential"
+    if mode_result and len(mode_result) > 0 and mode_result[0][0]:
+        execution_mode = mode_result[0][0]
+    
+    # --- NEW: Append '+' if sequential to trigger DAG dependencies ---
+    dbt_target = f"+final_{safe_name}" if execution_mode == 'sequential' else f"final_{safe_name}"
+    
     # We use 'shell=True' so Linux parses the whole string correctly.
-    # We drop the '-it' flag because Python runs this in the background, not interactively.
-    command = f'docker exec dbt bash -c "cd formula1 && dbt run --select final_{safe_name}"'
+    command = f'docker exec dbt bash -c "cd formula1 && dbt run --select {dbt_target}"'
     
     try:
         result = subprocess.run(
@@ -616,11 +641,10 @@ def execute_dbt_rule(rule_name):
         )
 
         if result.returncode == 0:
-            # Capturing stdout so you can actually see the success logs in the Streamlit UI!
-            return True, f"✅ DBT Executed Successfully!\n\nExecution Logs:\n{result.stdout}"
+            return True, f"✅ DBT Executed Successfully (Target: {dbt_target})!\n\nExecution Logs:\n{result.stdout}"
         else:
             error_output = result.stderr if result.stderr else result.stdout
-            return False, f"DBT execution failed. Logs:\n{error_output}"
+            return False, f"DBT execution failed (Target: {dbt_target}). Logs:\n{error_output}"
             
     except Exception as e:
         return False, f"System error calling Docker: {e}"
@@ -733,6 +757,7 @@ else:
     user = st.session_state.user_info
     
     # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
+    # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
     try:
         TABLE_SCHEMAS = get_iceberg_schemas()
         if not TABLE_SCHEMAS:
@@ -741,6 +766,30 @@ else:
         st.error(f"Failed to fetch schemas from MinIO: {e}")
         TABLE_SCHEMAS = {}
         
+    # --- NEW: Inject saved rules (including Ephemeral) into the UI Dropdowns ---
+    saved_rules_list = get_existing_rules()
+    if saved_rules_list:
+        for r in saved_rules_list:
+            rule_nm = r[1]
+            # Format the name exactly how dbt will save it in the final_rules folder
+            target_model_name = f"final_{re.sub(r'[^a-zA-Z0-9_]', '_', rule_nm.lower())}"
+            
+            # If Iceberg didn't find it (because it's ephemeral), build its schema from JSON!
+            if target_model_name not in TABLE_SCHEMAS:
+                state = load_ui_state(rule_nm)
+                if state:
+                    # Reconstruct the expected output columns
+                    simulated_cols = state.get("primary_columns", [])
+                    for j_cols in state.get("cols_joins", {}).values():
+                        simulated_cols.extend(j_cols)
+                    for agg in state.get("aggregations", []):
+                        if agg.get("alias"):
+                            simulated_cols.append(agg["alias"])
+                    
+                    if simulated_cols:
+                        # Add it to our schemas dictionary so Streamlit can use it!
+                        TABLE_SCHEMAS[target_model_name] = list(set(simulated_cols))
+
     TABLE_NAMES = list(TABLE_SCHEMAS.keys())
     if not TABLE_NAMES:
         st.error("No tables available to build query.")
@@ -929,21 +978,42 @@ else:
                     if st.button("✅ Force Approve", use_container_width=True):
                         if run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE' WHERE rule_id = {sel_rule_id}"):
                             
+                            # --- NEW: Add the Level 3 Approval Record so UI updates! ---
+                            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            admin_user_id = user['user_id']
+                            next_app_id = get_next_approval_id()
+                            
+                            force_approve_sql = f"""
+                            INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+                            (approval_id, rule_id, user_id, level_id, action, comments, action_date)
+                            VALUES (
+                                {next_app_id}, {sel_rule_id}, '{admin_user_id}', 3, 
+                                'APPROVED', 'Force Approved by System Admin.', CAST('{now}' AS TIMESTAMP)
+                            )
+                            """
+                            run_update(force_approve_sql)
+                            # ------------------------------------------------------------
+
                             with st.spinner("Finalizing file and running DBT..."):
                                 # Step 1: Create the file
                                 success_copy, copy_msg = create_final_rule_file(sel_rule_name)
                                 
                                 if success_copy:
-                                    # Step 2: Execute it
-                                    success_exec, exec_msg = execute_dbt_rule(sel_rule_name)
-                                    if success_exec:
-                                        st.success(f"✅ Rule ID {sel_rule_id} forced to ACTIVE and executed successfully!")
+                                    # Step 2: Execute it (Includes our previous ephemeral check!)
+                                    sql_content = read_dbt_sql(sel_rule_name)
+                                    
+                                    if "materialized='ephemeral'" in sql_content or 'materialized="ephemeral"' in sql_content:
+                                        st.success(f"✅ Rule ID {sel_rule_id} forced to ACTIVE. Saved as Ephemeral CTE. Execution skipped.")
                                     else:
-                                        st.error(f"⚠️ File created, but DBT execution failed:\n{exec_msg}")
+                                        success_exec, exec_msg = execute_dbt_rule(sel_rule_name)
+                                        if success_exec:
+                                            st.success(f"✅ Rule ID {sel_rule_id} forced to ACTIVE and executed successfully!")
+                                        else:
+                                            st.error(f"⚠️ File created, but DBT execution failed:\n{exec_msg}")
                                 else:
                                     st.error(f"❌ Forced to ACTIVE, but file issue: {copy_msg}")
                                 
-                            time.sleep(3.5) # Paused so you can read any output logs
+                            time.sleep(3.5)
                             st.rerun()
                             
                 with col2:
@@ -1044,6 +1114,53 @@ else:
                 current_id = get_next_rule_id()
                 st.info(f"🆕 Creating Rule ID: **{current_id}**")
                 r_name = st.text_input("Rule Name (Compulsory)", placeholder="e.g., Driver Standings 2023 Analysis")
+                # --- ADD THIS BELOW THE RULE NAME INPUT ---
+                # --- START EXECUTION STRATEGY UI ---
+                st.markdown("#### Execution Strategy")
+                
+                # Safely load saved modes or default to standard
+                loaded_exec = st.session_state.get("execution_mode", "non_sequential")
+                exec_opts = ["non_sequential", "sequential"]
+                exec_idx = exec_opts.index(loaded_exec) if loaded_exec in exec_opts else 0
+                
+                execution_mode = st.radio("Execution Mode:", exec_opts, horizontal=True, index=exec_idx, key="exec_mode_widget")
+
+                loaded_mat = st.session_state.get("materialization", "table")
+                mat_opts = ["ephemeral", "table"]
+                mat_idx = mat_opts.index(loaded_mat) if loaded_mat in mat_opts else 1
+                
+                materialization = st.radio(
+                    "Materialization (Database Save Type):", 
+                    mat_opts, 
+                    horizontal=True, 
+                    index=mat_idx,
+                    key="mat_widget",
+                    help="Select 'ephemeral' for intermediate steps to compile as CTEs. Select 'table' for your final output."
+                )
+
+                sequence_order = 0
+                parent_rule_id = "NULL"
+
+                if execution_mode == "sequential":
+                    col_seq1, col_seq2 = st.columns(2)
+                    with col_seq1:
+                        loaded_seq = st.session_state.get("sequence_order", 1)
+                        sequence_order = st.number_input("Sequence Order (e.g., 1, 2, 3)", min_value=1, step=1, value=int(loaded_seq), key="seq_ord_widget")
+                    with col_seq2:
+                        existing_rules = get_existing_rules()
+                        rule_options = {"None (First in Sequence)": "NULL"}
+                        if existing_rules:
+                            for r in existing_rules:
+                                rule_options[f"ID: {r[0]} - {r[1]}"] = r[0]
+                                
+                        loaded_parent = st.session_state.get("parent_rule_id", "NULL")
+                        parent_keys = list(rule_options.keys())
+                        parent_vals = list(rule_options.values())
+                        p_idx = parent_vals.index(loaded_parent) if loaded_parent in parent_vals else 0
+                        
+                        parent_selection = st.selectbox("Depends on Parent Rule:", parent_keys, index=p_idx, key="parent_rule_widget")
+                        parent_rule_id = rule_options[parent_selection]
+                # --- END EXECUTION STRATEGY UI ---
             else:
                 existing_rules = get_existing_rules()
                 if existing_rules:
@@ -1287,12 +1404,23 @@ else:
                     elif filter_data['op'] == "BETWEEN":
                         sub_col1, sub_col2 = st.columns(2)
                         with sub_col1:
-                            filter_data['val'] = st.text_input("From", value=filter_data.get('val', ''), key=f"w_val1_{uid}")
+                            w_val1_key = f"w_val1_{uid}"
+                            # 1. Force the saved string into session state BEFORE drawing
+                            if w_val1_key not in st.session_state:
+                                st.session_state[w_val1_key] = filter_data.get('val', '')
+                            # 2. Draw the widget relying entirely on the state key
+                            filter_data['val'] = st.text_input("From", key=w_val1_key)
                         with sub_col2:
-                            filter_data['val2'] = st.text_input("To", value=filter_data.get('val2', ''), key=f"w_val2_{uid}")
+                            w_val2_key = f"w_val2_{uid}"
+                            if w_val2_key not in st.session_state:
+                                st.session_state[w_val2_key] = filter_data.get('val2', '')
+                            filter_data['val2'] = st.text_input("To", key=w_val2_key)
                     else:
-                        filter_data['val'] = st.text_input("Value", value=filter_data.get('val', ''), key=f"w_val_{uid}")
-                        filter_data['val2'] = "" 
+                        w_val_key = f"w_val_{uid}"
+                        if w_val_key not in st.session_state:
+                            st.session_state[w_val_key] = filter_data.get('val', '')
+                        filter_data['val'] = st.text_input("Value", key=w_val_key)
+                        filter_data['val2'] = ""
 
                 with row_col5:
                     st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
@@ -1411,108 +1539,194 @@ else:
         with st.container(border=True):
             st.markdown("#### 4. Preview & Run")
             
-            all_tables_in_query = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
-            unique_tables = list(dict.fromkeys(all_tables_in_query)) 
+            # all_tables_in_query = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
+            # unique_tables = list(dict.fromkeys(all_tables_in_query)) 
             
-            cte_clauses = [f"{tbl} AS (\n    SELECT * FROM {{{{ ref('{tbl}') }}}}\n)" for tbl in unique_tables]
-            cte_block = "WITH " + ",\n".join(cte_clauses) if cte_clauses else ""
+            # cte_clauses = [f"{tbl} AS (\n    SELECT * FROM {{{{ ref('{tbl}') }}}}\n)" for tbl in unique_tables]
+            # cte_block = "WITH " + ",\n".join(cte_clauses) if cte_clauses else ""
             
-            non_agg_cols = [f"{t1}.{c}" for c in cols_t1]
+            # non_agg_cols = [f"{t1}.{c}" for c in cols_t1]
+            # for r_table, cols in cols_joins.items():
+            #     non_agg_cols.extend([f"{r_table}.{c}" for c in cols])
+            
+            # agg_expressions = []
+            # has_valid_aggregations = False
+            # for agg in st.session_state.aggregations:
+            #     if agg.get('col') and agg.get('func'):
+            #         has_valid_aggregations = True
+            #         agg_expr = f"{agg['func']}({agg['col']})"
+            #         if agg.get('alias'):
+            #             agg_expr += f" AS {agg['alias']}"
+            #         agg_expressions.append(agg_expr)
+            
+            # all_select_cols = non_agg_cols + agg_expressions
+            # select_clause = "SELECT\n    " + (",\n    ".join(all_select_cols) if all_select_cols else "*")
+            
+            # from_clause = f"FROM {t1}"
+            
+            # for join_data in st.session_state.joins:
+            #     r_table = join_data.get("right_table")
+            #     if not r_table: 
+            #         continue
+                    
+            #     j_type = join_data["join_type"]
+                
+            #     if j_type == "CROSS JOIN":
+            #         from_clause += f"\nCROSS JOIN {r_table}"
+            #     else:
+            #         l_table = join_data["left_table"] if join_data["left_table"] else t1
+            #         l_col = join_data["left_col"]
+            #         r_col = join_data["right_col"]
+            #         from_clause += f"\n{j_type} {r_table}\n  ON {l_table}.{l_col} = {r_table}.{r_col}"
+
+            # where_clauses = []
+            # for i, f in enumerate(st.session_state.where_filters):
+            #     if f['col']:
+            #         logic = f"{f['logic']} " if i > 0 else ""
+                    
+            #         op_map = {
+            #             "equals (=)": "=", "greater than (>)": ">", "less than (<)": "<", 
+            #             "not equals (!=)": "!=", "greater than equal (>=)": ">=", 
+            #             "less than equal (<=)": "<=", "LIKE": "LIKE", "NOT LIKE": "NOT LIKE", 
+            #             "IN": "IN", "NOT IN": "NOT IN", "BETWEEN": "BETWEEN",
+            #             "IS": "IS", "IS NOT": "IS NOT", "IS NULL": "IS NULL", "IS NOT NULL": "IS NOT NULL"
+            #         }
+            #         op_sql = op_map.get(f['op'], "=")
+                    
+            #         if f['op'] in ["IS NULL", "IS NOT NULL"]:
+            #             where_clauses.append(f"{logic}{f['col']} {op_sql}")
+            #         elif f['op'] == "BETWEEN" and f.get('val') and f.get('val2'):
+            #             v1 = f['val'] if is_numeric_literal(f['val']) else f"'{f['val']}'"
+            #             v2 = f['val2'] if is_numeric_literal(f['val2']) else f"'{f['val2']}'"
+            #             where_clauses.append(f"{logic}{f['col']} BETWEEN {v1} AND {v2}")
+            #         elif f.get('val') and f['op'] not in ["BETWEEN", "IS NULL", "IS NOT NULL"]:
+            #             is_unquoted = f['op'] in ["IN", "NOT IN", "IS", "IS NOT"] or f['val'].upper() in ("NULL", "TRUE", "FALSE")
+            #             val = f['val'] if is_unquoted or is_numeric_literal(f['val']) else f"'{f['val']}'"
+            #             where_clauses.append(f"{logic}{f['col']} {op_sql} {val}")
+
+            # where_clause = ("\nWHERE " + "\n  ".join(where_clauses)) if where_clauses else ""
+
+            # having_clauses = []
+            # for i, h in enumerate(st.session_state.having_filters):
+            #     if h.get('func') and h.get('col') and h.get('op') and h.get('val'):
+            #         logic = f"{h.get('logic', 'AND')} " if i > 0 else ""
+            #         h_value = str(h['val']).strip()
+            #         h_sql_val = h_value if is_numeric_literal(h_value) else f"'{h_value}'"
+            #         having_clauses.append(f"{logic}{h['func']}({h['col']}) {h['op']} {h_sql_val}")
+
+            # having_clause = ("\nHAVING " + "\n  ".join(having_clauses)) if having_clauses else ""
+
+            # group_by_clause = ""
+            # manual_gb = st.session_state.get("manual_group_by", [])
+            
+            # # Combine automatically required group by columns and manually added ones
+            # all_group_by_cols = non_agg_cols + manual_gb
+            
+            # # Trigger GROUP BY if we have aggregations/having OR if the user manually selected something
+            # if all_group_by_cols and (has_valid_aggregations or having_clauses or manual_gb):
+            #     # dict.fromkeys removes duplicates just in case, while preserving order
+            #     unique_gb_cols = list(dict.fromkeys(all_group_by_cols))
+            #     group_by_clause = "\nGROUP BY " + ", ".join(unique_gb_cols)
+
+            # order_clauses = []
+            # for f in st.session_state.order_filters:
+            #     if f['col']:
+            #         order_clauses.append(f"{f['col']} {f['dir']}")
+
+            # order_clause = ("\nORDER BY " + ", ".join(order_clauses)) if order_clauses else ""
+
+            # limit_clause = ""
+            # row_limit_value = st.session_state.get("row_limit", None)
+            # if isinstance(row_limit_value, (int, float)) and int(row_limit_value) > 0:
+            #     limit_clause = f"\nLIMIT {int(row_limit_value)}"
+
+            # generated_sql = f"{cte_block}\n\n{select_clause}\n{from_clause}{where_clause}{group_by_clause}{having_clause}{order_clause}{limit_clause}"
+
+            # --- START OF MACRO GENERATION LOGIC ---
+            # 1. Tables
+            macro_tables = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
+            macro_tables = list(dict.fromkeys(macro_tables)) # Remove duplicates
+
+            # 2. Select Columns
+            macro_select_cols = [f"{t1}.{c}" for c in cols_t1]
             for r_table, cols in cols_joins.items():
-                non_agg_cols.extend([f"{r_table}.{c}" for c in cols])
-            
-            agg_expressions = []
-            has_valid_aggregations = False
+                macro_select_cols.extend([f"{r_table}.{c}" for c in cols])
+
+            # 3. Joins
+            macro_joins = []
+            for j in st.session_state.joins:
+                if j.get("right_table") and j.get("join_type") != "CROSS JOIN":
+                    l_table = j.get("left_table") if j.get("left_table") else t1
+                    macro_joins.append({
+                        'type': j.get("join_type"),
+                        'table': j.get("right_table"),
+                        'left': f"{l_table}.{j.get('left_col')}",
+                        'right': f"{j.get('right_table')}.{j.get('right_col')}"
+                    })
+
+            # 4. Aggregations & Group By
+            macro_aggs = []
             for agg in st.session_state.aggregations:
                 if agg.get('col') and agg.get('func'):
-                    has_valid_aggregations = True
-                    agg_expr = f"{agg['func']}({agg['col']})"
-                    if agg.get('alias'):
-                        agg_expr += f" AS {agg['alias']}"
-                    agg_expressions.append(agg_expr)
+                    macro_aggs.append({'func': agg['func'], 'col': agg['col'], 'alias': agg.get('alias', '')})
             
-            all_select_cols = non_agg_cols + agg_expressions
-            select_clause = "SELECT\n    " + (",\n    ".join(all_select_cols) if all_select_cols else "*")
-            
-            from_clause = f"FROM {t1}"
-            
-            for join_data in st.session_state.joins:
-                r_table = join_data.get("right_table")
-                if not r_table: 
-                    continue
-                    
-                j_type = join_data["join_type"]
-                
-                if j_type == "CROSS JOIN":
-                    from_clause += f"\nCROSS JOIN {r_table}"
-                else:
-                    l_table = join_data["left_table"] if join_data["left_table"] else t1
-                    l_col = join_data["left_col"]
-                    r_col = join_data["right_col"]
-                    from_clause += f"\n{j_type} {r_table}\n  ON {l_table}.{l_col} = {r_table}.{r_col}"
+            macro_group_by = []
+            if macro_aggs or st.session_state.having_filters or st.session_state.get("manual_group_by"):
+                all_group_by_cols = macro_select_cols + st.session_state.get("manual_group_by", [])
+                macro_group_by = list(dict.fromkeys(all_group_by_cols))
 
-            where_clauses = []
-            for i, f in enumerate(st.session_state.where_filters):
+            # 5. Where Filters
+            macro_where = []
+            for f in st.session_state.where_filters:
                 if f['col']:
-                    logic = f"{f['logic']} " if i > 0 else ""
+                    op_val = f['op'].split(" ")[0] if " " in f['op'] and "equals" in f['op'] else f['op']
+                    if op_val == "equals": op_val = "="
                     
-                    op_map = {
-                        "equals (=)": "=", "greater than (>)": ">", "less than (<)": "<", 
-                        "not equals (!=)": "!=", "greater than equal (>=)": ">=", 
-                        "less than equal (<=)": "<=", "LIKE": "LIKE", "NOT LIKE": "NOT LIKE", 
-                        "IN": "IN", "NOT IN": "NOT IN", "BETWEEN": "BETWEEN",
-                        "IS": "IS", "IS NOT": "IS NOT", "IS NULL": "IS NULL", "IS NOT NULL": "IS NOT NULL"
-                    }
-                    op_sql = op_map.get(f['op'], "=")
-                    
-                    if f['op'] in ["IS NULL", "IS NOT NULL"]:
-                        where_clauses.append(f"{logic}{f['col']} {op_sql}")
-                    elif f['op'] == "BETWEEN" and f.get('val') and f.get('val2'):
-                        v1 = f['val'] if is_numeric_literal(f['val']) else f"'{f['val']}'"
-                        v2 = f['val2'] if is_numeric_literal(f['val2']) else f"'{f['val2']}'"
-                        where_clauses.append(f"{logic}{f['col']} BETWEEN {v1} AND {v2}")
-                    elif f.get('val') and f['op'] not in ["BETWEEN", "IS NULL", "IS NOT NULL"]:
-                        is_unquoted = f['op'] in ["IN", "NOT IN", "IS", "IS NOT"] or f['val'].upper() in ("NULL", "TRUE", "FALSE")
-                        val = f['val'] if is_unquoted or is_numeric_literal(f['val']) else f"'{f['val']}'"
-                        where_clauses.append(f"{logic}{f['col']} {op_sql} {val}")
+                    val = str(f.get('val', ''))
+                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']:
+                        val = f"'{val}'"
+                        
+                    macro_where.append({
+                        'col': f['col'],
+                        'op': op_val,
+                        'value': val,
+                        'logic': f.get('logic', '')
+                    })
 
-            where_clause = ("\nWHERE " + "\n  ".join(where_clauses)) if where_clauses else ""
+            # 6. Having Filters
+            macro_having = []
+            for h in st.session_state.having_filters:
+                if h.get('col') and h.get('func') and h.get('val'):
+                    val = str(h.get('val', ''))
+                    if not is_numeric_literal(val): val = f"'{val}'"
+                    macro_having.append({
+                        'func': h['func'], 'col': h['col'], 'op': h['op'], 
+                        'value': val, 'logic': h.get('logic', '')
+                    })
 
-            having_clauses = []
-            for i, h in enumerate(st.session_state.having_filters):
-                if h.get('func') and h.get('col') and h.get('op') and h.get('val'):
-                    logic = f"{h.get('logic', 'AND')} " if i > 0 else ""
-                    h_value = str(h['val']).strip()
-                    h_sql_val = h_value if is_numeric_literal(h_value) else f"'{h_value}'"
-                    having_clauses.append(f"{logic}{h['func']}({h['col']}) {h['op']} {h_sql_val}")
+            # 7. Order By & Limit
+            # 7. Order By & Limit
+            macro_order = [{'col': o['col'], 'dir': o['dir']} for o in st.session_state.order_filters if o.get('col')]
+            macro_limit = st.session_state.get("row_limit") or 'None'
 
-            having_clause = ("\nHAVING " + "\n  ".join(having_clauses)) if having_clauses else ""
+            # --- NEW: Build the dbt config block ---
+            # Fetch the materialization choice from the UI, defaulting to 'table'
+            mat_type = locals().get('materialization', 'table')
+            config_block = f"{{{{ config(materialized='{mat_type}') }}}}\n\n"
 
-            group_by_clause = ""
-            manual_gb = st.session_state.get("manual_group_by", [])
-            
-            # Combine automatically required group by columns and manually added ones
-            all_group_by_cols = non_agg_cols + manual_gb
-            
-            # Trigger GROUP BY if we have aggregations/having OR if the user manually selected something
-            if all_group_by_cols and (has_valid_aggregations or having_clauses or manual_gb):
-                # dict.fromkeys removes duplicates just in case, while preserving order
-                unique_gb_cols = list(dict.fromkeys(all_group_by_cols))
-                group_by_clause = "\nGROUP BY " + ", ".join(unique_gb_cols)
-
-            order_clauses = []
-            for f in st.session_state.order_filters:
-                if f['col']:
-                    order_clauses.append(f"{f['col']} {f['dir']}")
-
-            order_clause = ("\nORDER BY " + ", ".join(order_clauses)) if order_clauses else ""
-
-            limit_clause = ""
-            row_limit_value = st.session_state.get("row_limit", None)
-            if isinstance(row_limit_value, (int, float)) and int(row_limit_value) > 0:
-                limit_clause = f"\nLIMIT {int(row_limit_value)}"
-
-            generated_sql = f"{cte_block}\n\n{select_clause}\n{from_clause}{where_clause}{group_by_clause}{having_clause}{order_clause}{limit_clause}"
+            # 8. Build the Final Jinja String
+            generated_sql = f"""{config_block}{{{{ rule_engine(
+    tables={macro_tables},
+    joins={macro_joins},
+    select_columns={macro_select_cols},
+    aggregations={macro_aggs},
+    where_filters={macro_where},
+    group_by={macro_group_by},
+    having={macro_having},
+    order_by={macro_order},
+    limit_rows={macro_limit}
+) }}}}"""
+            # --- END OF MACRO GENERATION LOGIC ---
             
             st.code(generated_sql, language="sql")
 
@@ -1537,7 +1751,12 @@ else:
                                 "manual_group_by": st.session_state.manual_group_by,
                                 "row_limit": st.session_state.row_limit,
                                 "where_filters": st.session_state.where_filters,
-                                "order_filters": st.session_state.order_filters
+                                "order_filters": st.session_state.order_filters,
+                                # --- NEW: Save Execution Strategy to JSON ---
+                                "execution_mode": execution_mode,
+                                "materialization": materialization,
+                                "sequence_order": sequence_order,
+                                "parent_rule_id": parent_rule_id
                             }
                             
                             # Save SQL to /dbt/
@@ -1545,15 +1764,25 @@ else:
                             
                             # Save JSON to /app/
                             save_ui_state(r_name, ui_state)
+
+                            # Define the target model name (sanitized rule name)
+                            target_model = re.sub(r'[^a-zA-Z0-9_]', '_', r_name.lower())
                             
+                            # Grab values from the UI (ensure you added these Streamlit widgets as discussed previously)
+                            # Fallbacks to defaults if the UI widgets aren't interacted with yet
+                            exec_mode = locals().get('execution_mode', 'non_sequential')
+                            seq_ord = locals().get('sequence_order', 0)
+                            p_rule_id = locals().get('parent_rule_id', 'NULL')
+
                             if action_mode == "Create New Rule":
                                 final_insert_id = get_next_rule_id() 
                                 db_query = f"""
                                 INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                                (rule_id, rule_name, status, created_by, created_at, updated_at)
+                                (rule_id, rule_name, status, created_by, created_at, updated_at, execution_mode, sequence_order, parent_rule_id, target_model_name)
                                 VALUES (
                                     {final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', 
-                                    CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP)
+                                    CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP),
+                                    '{exec_mode}', {seq_ord}, {p_rule_id}, '{target_model}'
                                 )
                                 """
                             else:
@@ -1561,9 +1790,32 @@ else:
                                 db_query = f"""
                                 UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
                                 SET status = 'IN_REVIEW',
-                                    updated_at = CAST('{now}' AS TIMESTAMP)
+                                    updated_at = CAST('{now}' AS TIMESTAMP),
+                                    execution_mode = '{exec_mode}',
+                                    sequence_order = {seq_ord},
+                                    parent_rule_id = {p_rule_id},
+                                    target_model_name = '{target_model}'
                                 WHERE rule_id = {final_insert_id}
                                 """
+                            
+                            # if action_mode == "Create New Rule":
+                            #     final_insert_id = get_next_rule_id() 
+                            #     db_query = f"""
+                            #     INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
+                            #     (rule_id, rule_name, status, created_by, created_at, updated_at)
+                            #     VALUES (
+                            #         {final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', 
+                            #         CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP)
+                            #     )
+                            #     """
+                            # else:
+                            #     final_insert_id = current_id
+                            #     db_query = f"""
+                            #     UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
+                            #     SET status = 'IN_REVIEW',
+                            #         updated_at = CAST('{now}' AS TIMESTAMP)
+                            #     WHERE rule_id = {final_insert_id}
+                            #     """
                             
                             with st.spinner("Saving workflow to database..."):
                                 # 1. Update/Insert the main rule

@@ -1,0 +1,29 @@
+{
+    "primary_table": "stg_races",
+    "primary_columns": [
+        "race_id"
+    ],
+    "joins": [],
+    "cols_joins": {},
+    "aggregations": [],
+    "having_filters": [],
+    "manual_group_by": [],
+    "row_limit": null,
+    "where_filters": [
+        {
+            "id": "095ecbdd-4019-4c18-9f0b-8b897339bdb5",
+            "col": "stg_races.race_year",
+            "op": "equals (=)",
+            "val": "2023",
+            "logic": "AND",
+            "val2": ""
+        }
+    ],
+    "order_filters": [
+        {
+            "id": "e99232b2-12fa-497d-9ad6-dfa6113b48ee",
+            "col": "",
+            "dir": "ASC"
+        }
+    ]
+}

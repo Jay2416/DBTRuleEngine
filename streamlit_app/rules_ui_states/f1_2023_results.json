@@ -1,0 +1,41 @@
+{
+    "primary_table": "final_f1_2023_races",
+    "primary_columns": [],
+    "joins": [
+        {
+            "id": "5ced3bb1-3872-49f4-b8f1-3d44a46c16ff",
+            "right_table": "stg_results",
+            "join_type": "INNER JOIN",
+            "left_table": "final_f1_2023_races",
+            "left_col": "race_id",
+            "right_col": "race_id"
+        }
+    ],
+    "cols_joins": {
+        "stg_results": [
+            "constructor_id",
+            "points_scored"
+        ]
+    },
+    "aggregations": [],
+    "having_filters": [],
+    "manual_group_by": [],
+    "row_limit": null,
+    "where_filters": [
+        {
+            "id": "095ecbdd-4019-4c18-9f0b-8b897339bdb5",
+            "col": "",
+            "op": "equals (=)",
+            "val": "2023",
+            "logic": "AND",
+            "val2": ""
+        }
+    ],
+    "order_filters": [
+        {
+            "id": "e99232b2-12fa-497d-9ad6-dfa6113b48ee",
+            "col": "",
+            "dir": "ASC"
+        }
+    ]
+}
