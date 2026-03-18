@@ -255,6 +255,43 @@ def is_numeric_literal(value):
     except ValueError:
         return False
 
+def normalize_ref_name(value):
+    """Normalize '{{ ref(...) }}' strings to raw model names for safe macro input."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    match = re.match(r"^\{\{\s*ref\(\s*['\"]([^'\"]+)['\"]\s*\)\s*\}\}$", text)
+    return match.group(1) if match else value
+
+def safe_model_name(value):
+    """Convert arbitrary rule/model names to dbt-safe identifiers."""
+    if value is None:
+        return ""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', str(value).lower())
+
+def resolve_group_relation_name(value, relation_map):
+    """Resolve a table token to either an in-group CTE name or external model name."""
+    raw_name = normalize_ref_name(value)
+    if not isinstance(raw_name, str):
+        return raw_name, False
+    cleaned = raw_name.strip()
+    if not cleaned:
+        return cleaned, False
+    if cleaned in relation_map:
+        return relation_map[cleaned], True
+    return cleaned, False
+
+def rewrite_column_reference(value, relation_map):
+    """Rewrite <table>.<column> references so in-group dependencies point to CTE names."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if "." not in text:
+        return text
+    table_part, column_part = text.split(".", 1)
+    resolved_table, _ = resolve_group_relation_name(table_part, relation_map)
+    return f"{resolved_table}.{column_part}" if resolved_table else text
+
 def _clear_dynamic_widget_keys():
     """Remove all dynamic widget keys so freshly loaded state values take effect."""
     prefixes = ('t_right_', 'j_type_', 'l_tbl_', 'l_col_', 'r_col_',
@@ -280,9 +317,10 @@ def get_next_rule_id():
     return 1
 
 def get_existing_rules():
-    """Fetches existing rules from the database."""
-    # Add ORDER BY to ensure the list is always in the exact same order
-    sql = f"SELECT rule_id, rule_name FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow ORDER BY rule_id ASC"
+    """Fetches existing ACTIVE rules from the database to use as data sources."""
+    # Added WHERE status = 'ACTIVE' so only approved rules can be selected as sources
+    sql = f"SELECT rule_id, rule_name FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE status = 'ACTIVE' ORDER BY rule_id ASC"
+    
     result = run_query(sql)
     return result if result else []
 
@@ -477,7 +515,6 @@ def load_rule_state(rule_name, group_name):
             if agg_data.get("alias"): st.session_state[f"agg_alias_{uid}"] = agg_data["alias"]
         
         # Step 11: Load Execution Strategy into Session State
-        st.session_state.materialization = state.get("materialization", "table")
         st.session_state.sequence_order = state.get("sequence_order", 1)
         
         return True
@@ -557,25 +594,24 @@ def process_approval(approval_id, rule_id, rule_name, level_id, user_id, action,
         else:
             # Level 3 (SME) approved it -> Rule is now ACTIVE
             run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE' WHERE rule_id = {rule_id}")
-            
-            # Step 1: Create the final file in the /final_rules directory
             success_copy, copy_msg = create_final_rule_file(rule_name)
             
             if success_copy:
-                # --- NEW LOGIC: Check materialization before executing ---
-                sql_content = read_dbt_sql(rule_name)
+                # Fetch Group Info
+                grp_sql = f"SELECT g.group_id, g.group_name, g.execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id WHERE r.rule_id = {rule_id}"
+                grp_res = run_query(grp_sql)
+                g_id, g_name, exec_mode = grp_res[0]
                 
-                # If it's an intermediate CTE step, do NOT execute Docker
-                if "materialized='ephemeral'" in sql_content or 'materialized="ephemeral"' in sql_content:
-                    return True, f"✅ Rule ACTIVE. Saved as Ephemeral CTE. Execution skipped until the final rule is run."
-                
-                # If it's a table/view, execute it
-                else:
+                if exec_mode == 'non_sequential':
                     success_exec, exec_msg = execute_dbt_rule(rule_name)
-                    if success_exec:
-                        return True, f"✅ Rule is ACTIVE and executed! {exec_msg}"
+                    return (True, f"✅ Rule ACTIVE and executed! {exec_msg}") if success_exec else (False, f"⚠️ File created, but execution failed: {exec_msg}")
+                else:
+                    if check_group_fully_approved(g_id):
+                        generate_group_sql(g_id, g_name)
+                        success_exec, exec_msg = execute_dbt_group(g_name)
+                        return (True, f"✅ Group Fully Approved! Master CTE compiled and executed! {exec_msg}") if success_exec else (False, f"⚠️ Master compiled, but execution failed: {exec_msg}")
                     else:
-                        return False, f"⚠️ Rule ACTIVE, file created, but execution failed: {exec_msg}"
+                        return True, "✅ Rule ACTIVE. Waiting for other rules in the group to be approved before executing the Master sequence."
             else:
                 return False, f"❌ Rule ACTIVE, but file copy failed: {copy_msg}"
             
@@ -745,6 +781,174 @@ def setup_new_group_environment(group_name):
         f.writelines(new_lines)
         
     return True, "Folders and YAML updated successfully."
+
+def generate_group_sql(group_id, group_name):
+    """
+    Universally fetches all rules for ANY sequential group, builds the steps array, 
+    and generates a single hierarchical SQL file using the sequential macro.
+    """
+    # 1. Fetch rules in the correct order (1000, 2000, 3000)
+    rules = get_rules_by_group(group_id)
+    if not rules:
+        return False, "No rules found in group."
+        
+    group_steps = []
+
+    # Build canonical CTE aliases and resolution map once for the entire group.
+    rule_cte_map = {r[1]: safe_model_name(r[1]) for r in rules}
+    relation_map = {}
+    for rule_name, cte_name in rule_cte_map.items():
+        safe_name = safe_model_name(rule_name)
+        relation_map[rule_name] = cte_name
+        relation_map[safe_name] = cte_name
+        relation_map[f"final_{safe_name}"] = cte_name
+    
+    # 2. Loop through rules and format the logic for the universal macro
+    for row in rules:
+        rule_id, rule_name, seq_order = row
+        state = load_ui_state(rule_name, group_name)
+        
+        if not state:
+            continue
+            
+        t1_raw = state.get("primary_table")
+        t1, is_primary_cte = resolve_group_relation_name(t1_raw, relation_map)
+        if not t1:
+            continue
+        
+        # Use resolved table token (either in-group CTE or external model).
+        from_table = t1
+
+        formatted_joins = []
+        for j in state.get("joins", []):
+            if j.get("right_table") and j.get("join_type") != "CROSS JOIN":
+                l_table = normalize_ref_name(j.get("left_table")) if j.get("left_table") else t1
+                r_table = normalize_ref_name(j.get("right_table"))
+                l_table_resolved, _ = resolve_group_relation_name(l_table, relation_map)
+                r_table_resolved, r_is_cte = resolve_group_relation_name(r_table, relation_map)
+                if not r_table_resolved:
+                    continue
+                
+                formatted_joins.append({
+                    'type': j.get("join_type"),
+                    'table': r_table_resolved,
+                    'is_cte': r_is_cte,
+                    'left': f"{l_table_resolved}.{j.get('left_col')}",
+                    'right': f"{r_table_resolved}.{j.get('right_col')}"
+                })
+
+        # Format Output Columns
+        select_cols = [f"{t1}.{c}" for c in state.get("primary_columns", [])]
+        for r_table, cols in state.get("cols_joins", {}).items():
+            resolved_r_table, _ = resolve_group_relation_name(r_table, relation_map)
+            if not resolved_r_table:
+                continue
+            select_cols.extend([f"{resolved_r_table}.{c}" for c in cols])
+
+        # Format Group By
+        macro_group_by = []
+        aggs = state.get("aggregations", [])
+        manual_gb = [rewrite_column_reference(c, relation_map) for c in state.get("manual_group_by", [])]
+        having = state.get("having_filters", [])
+        if aggs or having or manual_gb:
+            macro_group_by = list(dict.fromkeys(select_cols + manual_gb))
+
+        # Format Where Filters
+        macro_where = []
+        for f in state.get("where_filters", []):
+            if f['col']:
+                op_val = f['op'].split(" ")[0] if " " in f['op'] and "equals" in f['op'] else f['op']
+                if op_val == "equals": op_val = "="
+                val = str(f.get('val', ''))
+                if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']:
+                    val = f"'{val}'"
+                macro_where.append({
+                    'col': rewrite_column_reference(f['col'], relation_map),
+                    'op': op_val,
+                    'value': val,
+                    'logic': f.get('logic', '')
+                })
+
+        macro_having = []
+        for h in having:
+            if h.get('col') and h.get('func') and h.get('val'):
+                h_val = str(h.get('val', ''))
+                if not is_numeric_literal(h_val):
+                    h_val = f"'{h_val}'"
+                macro_having.append({
+                    'func': h['func'],
+                    'col': rewrite_column_reference(h['col'], relation_map),
+                    'op': h.get('op', '>'),
+                    'value': h_val,
+                    'logic': h.get('logic', '')
+                })
+
+        macro_order_by = []
+        for o in state.get("order_filters", []):
+            if o.get('col'):
+                macro_order_by.append({
+                    'col': rewrite_column_reference(o['col'], relation_map),
+                    'dir': o['dir']
+                })
+
+        # Build the final step dictionary for this specific rule
+        # Build the final step dictionary for this specific rule
+        step_dict = {
+            "rule_name": rule_cte_map.get(rule_name, safe_model_name(rule_name)),
+            "sequence_order": seq_order,
+            "primary_table": from_table,
+            "is_primary_cte": is_primary_cte, # Pass the flag
+            "select_columns": select_cols,
+            "aggregations": [{'func': a['func'], 'col': a['col'], 'alias': a.get('alias', '')} for a in aggs if a['col'] and a['func']],
+            "joins": formatted_joins,
+            "where_filters": macro_where,
+            "group_by": macro_group_by,
+            "having": macro_having,
+            "order_by": macro_order_by,
+            "limit_rows": state.get("row_limit") or 'None'
+        }
+        group_steps.append(step_dict)
+
+    # 3. Build the final Jinja string wrapping the universal macro
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    
+    generated_sql = f"""{{{{ config(materialized='table') }}}}
+
+{{{{ sequential_rule_engine(
+    steps={group_steps}
+) }}}}"""
+
+    # --- FIXED: Save to the final_rules folder instead of draft ---
+    dbt_dir = os.path.join("/", "dbt", "formula1", "models", "final_rules", f"final_{safe_group}")
+    os.makedirs(dbt_dir, exist_ok=True)
+    
+    filepath = os.path.join(dbt_dir, f"final_{safe_group}.sql")
+    with open(filepath, "w") as f:
+        f.write(generated_sql)
+        
+    return True, filepath
+
+def check_group_fully_approved(group_id):
+    """Checks if all rules in a specific group have 'ACTIVE' status."""
+    sql = f"SELECT count(*) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE group_id = {group_id} AND status != 'ACTIVE'"
+    res = run_query(sql)
+    return True if (res and res[0][0] == 0) else False
+
+def execute_dbt_group(group_name):
+    """Executes the unified group SQL file."""
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    dbt_target = f"final_{safe_group}"
+    
+    command = f'docker exec dbt bash -c "cd formula1 && dbt run --select {dbt_target}"'
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return True, f"✅ Group Executed Successfully!\n\nLogs:\n{result.stdout}"
+        else:
+            error_output = result.stderr if result.stderr else result.stdout
+            return False, f"Group execution failed. Logs:\n{error_output}"
+    except Exception as e:
+        return False, f"System error calling Docker: {e}"
 
 
 
@@ -1095,22 +1299,26 @@ else:
                             run_update(force_approve_sql)
                             # ------------------------------------------------------------
 
-                            with st.spinner("Finalizing file and running DBT..."):
-                                # Step 1: Create the file
+                            with st.spinner("Finalizing file and checking group status..."):
                                 success_copy, copy_msg = create_final_rule_file(sel_rule_name)
                                 
                                 if success_copy:
-                                    # Step 2: Execute it (Includes our previous ephemeral check!)
-                                    sql_content = read_dbt_sql(sel_rule_name)
-                                    
-                                    if "materialized='ephemeral'" in sql_content or 'materialized="ephemeral"' in sql_content:
-                                        st.success(f"✅ Rule ID {sel_rule_id} forced to ACTIVE. Saved as Ephemeral CTE. Execution skipped.")
-                                    else:
+                                    grp_sql = f"SELECT g.group_id, g.group_name, g.execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id WHERE r.rule_id = {sel_rule_id}"
+                                    grp_res = run_query(grp_sql)
+                                    g_id, g_name, exec_mode = grp_res[0]
+
+                                    if exec_mode == 'non_sequential':
                                         success_exec, exec_msg = execute_dbt_rule(sel_rule_name)
-                                        if success_exec:
-                                            st.success(f"✅ Rule ID {sel_rule_id} forced to ACTIVE and executed successfully!")
+                                        if success_exec: st.success(f"✅ Rule forced to ACTIVE and executed!")
+                                        else: st.error(f"⚠️ DBT execution failed:\n{exec_msg}")
+                                    else:
+                                        if check_group_fully_approved(g_id):
+                                            generate_group_sql(g_id, g_name)
+                                            success_exec, exec_msg = execute_dbt_group(g_name)
+                                            if success_exec: st.success("✅ Sequence Complete! Master group file generated and executed.")
+                                            else: st.error(f"⚠️ Group compiled but failed to run:\n{exec_msg}")
                                         else:
-                                            st.error(f"⚠️ File created, but DBT execution failed:\n{exec_msg}")
+                                            st.success("✅ Rule forced to ACTIVE. Execution paused until all rules in group are approved.")
                                 else:
                                     st.error(f"❌ Forced to ACTIVE, but file issue: {copy_msg}")
                                 
@@ -1137,19 +1345,24 @@ else:
                             safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
                             safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', sel_rule_name.lower())
                             
-                            # Delete SQL file from DBT Volume
+                            # A. Delete Draft SQL file from /rules folder
                             sql_path = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group, f"{safe_name}.sql")
                             if os.path.exists(sql_path): 
                                 os.remove(sql_path)
                                 
-                            # Delete JSON State from MinIO
+                            # B. Delete Final SQL file from /final_rules folder (if it was approved)
+                            final_sql_path = os.path.join("/", "dbt", "formula1", "models", "final_rules", f"final_{safe_group}", f"final_{safe_name}.sql")
+                            if os.path.exists(final_sql_path):
+                                os.remove(final_sql_path)
+                                
+                            # C. Delete JSON State from MinIO
                             try:
                                 s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
                                 s3_client.delete_object(Bucket=MINIO_BUCKET, Key=f"ui_states/{safe_group}/{safe_name}.json")
                             except Exception as e:
                                 st.warning(f"Note: Could not delete UI state from MinIO: {e}")
                                 
-                            st.error(f"Rule ID {sel_rule_id} and its associated files have been permanently deleted.")
+                            st.error(f"Rule ID {sel_rule_id} and all associated files (Draft & Final) have been permanently deleted.")
                             time.sleep(1.5)
                             st.rerun()
             else:
@@ -1327,28 +1540,26 @@ else:
 
                 # --- CONDITIONAL SEQUENCE & MATERIALIZATION INPUT ---
                 # This now applies to both Create and Update!
+                # --- CONDITIONAL SEQUENCE INPUT ---
+                # This now applies to both Create and Update!
                 if r_name or action_mode == "Create New Rule":
                     st.divider()
                     
-                    col_mat1, col_mat2 = st.columns(2)
-                    with col_mat1:
-                        if st.session_state.active_group_mode == 'sequential':
-                            st.markdown("**Sequential Execution Setup**")
-                            loaded_seq = st.session_state.get("sequence_order", 1)
-                            sequence_order = st.number_input("Sequence Order (e.g., 1000, 2000, 3000)", min_value=1, step=1, value=int(loaded_seq))
-                        else:
-                            st.info("ℹ️ Group is non-sequential. All rules run in parallel.")
-                            sequence_order = 0
-                            
-                    with col_mat2:
-                        loaded_mat = st.session_state.get("materialization", "table")
-                        mat_opts = ["ephemeral", "table"]
-                        mat_idx = mat_opts.index(loaded_mat) if loaded_mat in mat_opts else 1
-                        materialization = st.radio("Materialization (Database Save Type):", mat_opts, horizontal=True, index=mat_idx)
+                    if st.session_state.active_group_mode == 'sequential':
+                        st.markdown("**Sequential Execution Setup**")
+                        loaded_seq = st.session_state.get("sequence_order", 1)
+                        sequence_order = st.number_input("Sequence Order (e.g., 1, 2, 3)", min_value=1, step=1, value=int(loaded_seq))
+                    else:
+                        st.info("ℹ️ Group is non-sequential. All rules run in parallel.")
+                        sequence_order = 0
             # ---------------------------------------------------------
         # ---------------------------------------------------------
         # 3 & 4. DATA SOURCES, JOINS & OUTPUT COLUMNS (50-50 Split)
         # ---------------------------------------------------------
+        
+        # --- NEW: Helper to visually hide 'final_' from the UI ---
+        clean_name = lambda x: x.replace("final_", "") if isinstance(x, str) and x.startswith("final_") else x
+        
         col_src1, col_src2 = st.columns(2)
         
         with col_src1:
@@ -1357,9 +1568,9 @@ else:
                 
                 # Check if the widget's key is already populated from the loaded JSON
                 if "t1" in st.session_state:
-                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, key="t1")
+                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, key="t1", format_func=clean_name)
                 else:
-                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, index=0, key="t1")
+                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, index=0, key="t1", format_func=clean_name)
                 
                 st.markdown("**Joins Configuration**")
                 joins_to_remove = []
@@ -1371,10 +1582,10 @@ else:
                     
                     t_right_key = f"t_right_{uid}"
                     if t_right_key in st.session_state:
-                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, key=t_right_key)
+                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, key=t_right_key, format_func=clean_name)
                     else:
                         right_table_idx = safe_index(TABLE_NAMES, join_data.get("right_table"))
-                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, index=right_table_idx, key=t_right_key)
+                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, index=right_table_idx, key=t_right_key, format_func=clean_name)
                     
                     join_types = ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "FULL OUTER JOIN", "CROSS JOIN"]
                     j_type_key = f"j_type_{uid}"
@@ -1390,28 +1601,28 @@ else:
                             left_tbl_opts = available_left_tables[:i+1]
                             l_tbl_key = f"l_tbl_{uid}"
                             if l_tbl_key in st.session_state:
-                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, key=l_tbl_key)
+                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, key=l_tbl_key, format_func=clean_name)
                             else:
                                 left_tbl_idx = safe_index(left_tbl_opts, join_data.get("left_table"))
-                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, index=left_tbl_idx, key=l_tbl_key)
+                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, index=left_tbl_idx, key=l_tbl_key, format_func=clean_name)
                             
                             l_table_actual = join_data["left_table"] if join_data["left_table"] else t1
                             l_cols = TABLE_SCHEMAS.get(l_table_actual, [])
                             l_col_key = f"l_col_{uid}"
                             if l_col_key in st.session_state:
-                                join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, key=l_col_key)
+                                join_data["left_col"] = st.selectbox(f"Column in {clean_name(l_table_actual)}:", l_cols, key=l_col_key)
                             else:
                                 left_col_idx = safe_index(l_cols, join_data.get("left_col"))
-                                join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, index=left_col_idx, key=l_col_key)
+                                join_data["left_col"] = st.selectbox(f"Column in {clean_name(l_table_actual)}:", l_cols, index=left_col_idx, key=l_col_key)
                         with sub_col2:
                             r_table_actual = join_data["right_table"]
                             r_cols = TABLE_SCHEMAS.get(r_table_actual, [])
                             r_col_key = f"r_col_{uid}"
                             if r_col_key in st.session_state:
-                                join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, key=r_col_key)
+                                join_data["right_col"] = st.selectbox(f"Column in {clean_name(r_table_actual)}:", r_cols, key=r_col_key)
                             else:
                                 right_col_idx = safe_index(r_cols, join_data.get("right_col"))
-                                join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, index=right_col_idx, key=r_col_key)
+                                join_data["right_col"] = st.selectbox(f"Column in {clean_name(r_table_actual)}:", r_cols, index=right_col_idx, key=r_col_key)
                     
                     if st.button("➖ Remove Join", key=f"rm_j_{uid}"):
                         joins_to_remove.append(i)
@@ -1437,7 +1648,8 @@ else:
                 if primary_cols_key not in st.session_state:
                     st.session_state[primary_cols_key] = TABLE_SCHEMAS.get(t1, [])[:3]
                 
-                cols_t1 = st.multiselect(f"Output Columns for {t1}:", TABLE_SCHEMAS.get(t1, []), key=primary_cols_key)
+                # Apply clean_name to the label
+                cols_t1 = st.multiselect(f"Output Columns for {clean_name(t1)}:", TABLE_SCHEMAS.get(t1, []), key=primary_cols_key)
                 
                 cols_joins = {}
                 for join_data in st.session_state.joins:
@@ -1447,7 +1659,8 @@ else:
                         if out_col_key not in st.session_state:
                             st.session_state[out_col_key] = TABLE_SCHEMAS.get(r_table, [])[:3]
                         
-                        cols_joins[r_table] = st.multiselect(f"Output Columns for {r_table}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key)
+                        # Apply clean_name to the label
+                        cols_joins[r_table] = st.multiselect(f"Output Columns for {clean_name(r_table)}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key)
 
         available_columns = [f"{t1}.{c}" for c in TABLE_SCHEMAS.get(t1, [])]
         for r_table in cols_joins.keys():
@@ -1693,95 +1906,62 @@ else:
             st.number_input("Maximum rows to return (leave blank or 0 for no limit)", value=None, min_value=1, step=1, key="row_limit", placeholder="e.g., 100")
 
         # 4. Preview & Run
+        # 4. Preview & Run
         with st.container(border=True):
             st.markdown("#### 4. Preview & Run")
 
-            # --- START OF MACRO GENERATION LOGIC ---
-            # 1. Tables
+            # --- ALWAYS GENERATE INDIVIDUAL DRAFT SQL FOR REVIEW ---
             macro_tables = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
-            macro_tables = list(dict.fromkeys(macro_tables)) # Remove duplicates
+            macro_tables = list(dict.fromkeys(macro_tables))
 
-            # 2. Select Columns
             macro_select_cols = [f"{t1}.{c}" for c in cols_t1]
             for r_table, cols in cols_joins.items():
                 macro_select_cols.extend([f"{r_table}.{c}" for c in cols])
 
-            # 3. Joins
             macro_joins = []
             for j in st.session_state.joins:
                 if j.get("right_table") and j.get("join_type") != "CROSS JOIN":
                     l_table = j.get("left_table") if j.get("left_table") else t1
                     macro_joins.append({
-                        'type': j.get("join_type"),
-                        'table': j.get("right_table"),
-                        'left': f"{l_table}.{j.get('left_col')}",
-                        'right': f"{j.get('right_table')}.{j.get('right_col')}"
+                        'type': j.get("join_type"), 'table': j.get("right_table"),
+                        'left': f"{l_table}.{j.get('left_col')}", 'right': f"{j.get('right_table')}.{j.get('right_col')}"
                     })
 
-            # 4. Aggregations & Group By
-            macro_aggs = []
-            for agg in st.session_state.aggregations:
-                if agg.get('col') and agg.get('func'):
-                    macro_aggs.append({'func': agg['func'], 'col': agg['col'], 'alias': agg.get('alias', '')})
+            macro_aggs = [{'func': a['func'], 'col': a['col'], 'alias': a.get('alias', '')} for a in st.session_state.aggregations if a.get('col') and a.get('func')]
             
             macro_group_by = []
             if macro_aggs or st.session_state.having_filters or st.session_state.get("manual_group_by"):
-                all_group_by_cols = macro_select_cols + st.session_state.get("manual_group_by", [])
-                macro_group_by = list(dict.fromkeys(all_group_by_cols))
+                macro_group_by = list(dict.fromkeys(macro_select_cols + st.session_state.get("manual_group_by", [])))
 
-            # 5. Where Filters
             macro_where = []
             for f in st.session_state.where_filters:
                 if f['col']:
                     op_val = f['op'].split(" ")[0] if " " in f['op'] and "equals" in f['op'] else f['op']
                     if op_val == "equals": op_val = "="
-                    
                     val = str(f.get('val', ''))
-                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']:
-                        val = f"'{val}'"
-                        
-                    macro_where.append({
-                        'col': f['col'],
-                        'op': op_val,
-                        'value': val,
-                        'logic': f.get('logic', '')
-                    })
+                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']: val = f"'{val}'"
+                    macro_where.append({'col': f['col'], 'op': op_val, 'value': val, 'logic': f.get('logic', '')})
 
-            # 6. Having Filters
             macro_having = []
             for h in st.session_state.having_filters:
                 if h.get('col') and h.get('func') and h.get('val'):
                     val = str(h.get('val', ''))
                     if not is_numeric_literal(val): val = f"'{val}'"
-                    macro_having.append({
-                        'func': h['func'], 'col': h['col'], 'op': h['op'], 
-                        'value': val, 'logic': h.get('logic', '')
-                    })
+                    macro_having.append({'func': h['func'], 'col': h['col'], 'op': h['op'], 'value': val, 'logic': h.get('logic', '')})
 
-            # 7. Order By & Limit
-            # 7. Order By & Limit
             macro_order = [{'col': o['col'], 'dir': o['dir']} for o in st.session_state.order_filters if o.get('col')]
             macro_limit = st.session_state.get("row_limit") or 'None'
 
-            # --- NEW: Build the dbt config block ---
-            # Fetch the materialization choice from the UI, defaulting to 'table'
-            mat_type = locals().get('materialization', 'table')
-            config_block = f"{{{{ config(materialized='{mat_type}') }}}}\n\n"
+            generated_sql = f"""{{{{ config(materialized='table') }}}}
 
-            # 8. Build the Final Jinja String
-            generated_sql = f"""{config_block}{{{{ rule_engine(
-    tables={macro_tables},
-    joins={macro_joins},
-    select_columns={macro_select_cols},
-    aggregations={macro_aggs},
-    where_filters={macro_where},
-    group_by={macro_group_by},
-    having={macro_having},
-    order_by={macro_order},
-    limit_rows={macro_limit}
+{{{{ rule_engine(
+    tables={macro_tables}, joins={macro_joins}, select_columns={macro_select_cols},
+    aggregations={macro_aggs}, where_filters={macro_where}, group_by={macro_group_by},
+    having={macro_having}, order_by={macro_order}, limit_rows={macro_limit}
 ) }}}}"""
-            # --- END OF MACRO GENERATION LOGIC ---
             
+            if st.session_state.active_group_mode == 'sequential':
+                st.info("🔄 **Sequential Group.** This draft file is for review purposes. Upon full approval, a unified macro will execute the sequence.")
             st.code(generated_sql, language="sql")
 
             col_btn1, col_btn2 = st.columns([2, 8])
@@ -1792,107 +1972,38 @@ else:
                     else:
                         now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         current_user = user['username']
-                        safe_sql = generated_sql.replace("'", "''")
-                        
                         try:
-                            # 1. Save UI State (Cleaned of deprecated keys)
                             ui_state = {
-                                "primary_table": t1,
-                                "primary_columns": cols_t1,
-                                "joins": st.session_state.joins,
-                                "cols_joins": cols_joins,
-                                "aggregations": st.session_state.aggregations,
-                                "having_filters": st.session_state.having_filters,
-                                "manual_group_by": st.session_state.manual_group_by,
-                                "row_limit": st.session_state.row_limit,
-                                "where_filters": st.session_state.where_filters,
-                                "order_filters": st.session_state.order_filters,
-                                "materialization": materialization,
-                                "sequence_order": sequence_order
+                                "primary_table": t1, "primary_columns": cols_t1, "joins": st.session_state.joins,
+                                "cols_joins": cols_joins, "aggregations": st.session_state.aggregations,
+                                "having_filters": st.session_state.having_filters, "manual_group_by": st.session_state.manual_group_by,
+                                "row_limit": st.session_state.row_limit, "where_filters": st.session_state.where_filters,
+                                "order_filters": st.session_state.order_filters, "sequence_order": sequence_order
                             }
                             
-                            # Save SQL to /dbt/
-                            dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
-                            
-                            # Save JSON to /app/
                             save_ui_state(r_name, st.session_state.active_group_name, ui_state)
+                            
+                            # ALWAYS save individual draft file
+                            dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
 
                             if action_mode == "Create New Rule":
                                 final_insert_id = get_next_rule_id() 
-                                db_query = f"""
-                                INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                                (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id)
-                                VALUES (
-                                    {final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', 
-                                    CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP),
-                                    {sequence_order}, {st.session_state.active_group_id}
-                                )
-                                """
+                                db_query = f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id) VALUES ({final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP), {sequence_order}, {st.session_state.active_group_id})"
                             else:
                                 final_insert_id = current_id
-                                db_query = f"""
-                                UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                                SET status = 'IN_REVIEW',
-                                    updated_at = CAST('{now}' AS TIMESTAMP),
-                                    sequence_order = {sequence_order},
-                                    group_id = {st.session_state.active_group_id}
-                                WHERE rule_id = {final_insert_id}
-                                """
-                            
-                            # if action_mode == "Create New Rule":
-                            #     final_insert_id = get_next_rule_id() 
-                            #     db_query = f"""
-                            #     INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                            #     (rule_id, rule_name, status, created_by, created_at, updated_at)
-                            #     VALUES (
-                            #         {final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', 
-                            #         CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP)
-                            #     )
-                            #     """
-                            # else:
-                            #     final_insert_id = current_id
-                            #     db_query = f"""
-                            #     UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                            #     SET status = 'IN_REVIEW',
-                            #         updated_at = CAST('{now}' AS TIMESTAMP)
-                            #     WHERE rule_id = {final_insert_id}
-                            #     """
+                                db_query = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'IN_REVIEW', updated_at = CAST('{now}' AS TIMESTAMP), sequence_order = {sequence_order}, group_id = {st.session_state.active_group_id} WHERE rule_id = {final_insert_id}"
                             
                             with st.spinner("Saving workflow to database..."):
-                                # 1. Update/Insert the main rule
                                 if run_update(db_query):
-                                    
-                                    # Fetch the Manager's user_id dynamically
                                     manager_id = get_manager_user_id()
-                                    
-                                    # Format for SQL (handle case where no manager exists gracefully)
                                     manager_id_sql = f"'{manager_id}'" if manager_id else "NULL"
-                                    
-                                    # 2. Insert into Approval Workflow (Level 1: Manager)
                                     approval_id = get_next_approval_id()
-                                    approval_query = f"""
-                                    INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
-                                    (approval_id, rule_id, user_id, level_id, action, comments, action_date)
-                                    VALUES (
-                                        {approval_id}, 
-                                        {final_insert_id}, 
-                                        {manager_id_sql},  -- Manager's actual user_id
-                                        1,                 -- Level 1 = Manager
-                                        'PENDING', 
-                                        'Rule submitted and awaiting Level 1 (Manager) review.', 
-                                        CAST('{now}' AS TIMESTAMP)
-                                    )
-                                    """
-                                    run_update(approval_query)
+                                    run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
                                     
-                                    st.success(f"✅ Rule '{r_name}' (ID: {final_insert_id}) successfully {'submitted' if action_mode == 'Create New Rule' else 'updated'} and routed to the Manager!")
-                                    if not manager_id:
-                                        st.warning("⚠️ No user with role 'MANAGER' found. The approval request was created but is unassigned.")
-                                    
-                                    st.info(f"📁 DBT script written to: `{dbt_filepath}`")
+                                    st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+                                    st.info(f"📁 Draft script written to: `{dbt_filepath}`")
                                 else:
-                                    st.warning(f"📁 DBT script written to `{dbt_filepath}`, but Database operation failed.")
-                                    
+                                    st.warning(f"📁 Database operation failed.")
                         except Exception as e:
                             st.error(f"❌ Failed to process rule: {e}")
                             
