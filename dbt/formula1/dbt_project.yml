@@ -36,14 +36,18 @@ models:
     +file_format: iceberg
     +schema: default
     staging:
-      +materialized: table
-      +file_format: iceberg
       +schema: staging
     rules:
-      +materialized: table
-      +file_format: iceberg
       +schema: rules
+      testing_group:
+        +schema: testing_group
+      championship_standings_2023:
+        +schema: championship_standings_2023
     final_rules:
-      +materialized: table
-      +file_format: iceberg
       +schema: final_rules
+
+      final_testing_group:
+        +schema: final_testing_group
+
+      final_championship_standings_2023:
+        +schema: final_championship_standings_2023

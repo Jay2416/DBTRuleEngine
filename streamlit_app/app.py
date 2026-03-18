@@ -286,10 +286,12 @@ def get_existing_rules():
     result = run_query(sql)
     return result if result else []
 
-def save_dbt_model(rule_name, sql_content):
-    """Saves the SQL query directly to the shared DBT container volume."""
+def save_dbt_model(rule_name, group_name, sql_content):
+    """Saves the SQL query directly to the shared DBT container volume inside a group folder."""
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
-    dbt_dir = os.path.join("/", "dbt", "formula1", "models", "rules")
+    
+    dbt_dir = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group)
     os.makedirs(dbt_dir, exist_ok=True)
     
     filepath = os.path.join(dbt_dir, f"{safe_name}.sql")
@@ -297,34 +299,43 @@ def save_dbt_model(rule_name, sql_content):
         f.write(sql_content)
     return filepath
 
-def save_ui_state(rule_name, state_dict):
-    """Saves the UI state as a JSON file in the Streamlit app volume."""
+def save_ui_state(rule_name, group_name, state_dict):
+    """Saves the UI state as a JSON file in MinIO inside a group folder."""
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
-    app_dir = os.path.join("/", "app", "rules_ui_states")
-    os.makedirs(app_dir, exist_ok=True)
+    s3_key = f"ui_states/{safe_group}/{safe_name}.json"
     
-    filepath = os.path.join(app_dir, f"{safe_name}.json")
-    with open(filepath, "w") as f:
-        json.dump(state_dict, f, indent=4)
+    s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+    try:
+        json_str = json.dumps(state_dict, indent=4)
+        s3_client.put_object(Bucket=MINIO_BUCKET, Key=s3_key, Body=json_str)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save UI state to MinIO: {e}")
+        return False
 
-def load_ui_state(rule_name):
-    """Loads the UI state from the local JSON file in the Streamlit app volume."""
+def load_ui_state(rule_name, group_name):
+    """Loads the UI state from the JSON file in MinIO from the group folder."""
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
-    filepath = os.path.join("/", "app", "rules_ui_states", f"{safe_name}.json")
+    s3_key = f"ui_states/{safe_group}/{safe_name}.json"
     
-    if os.path.exists(filepath):
-        with open(filepath, "r") as f:
-            return json.load(f)
-    return None
+    s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+    try:
+        response = s3_client.get_object(Bucket=MINIO_BUCKET, Key=s3_key)
+        state = json.loads(response['Body'].read().decode('utf-8'))
+        return state
+    except s3_client.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        st.error(f"Failed to load UI state from MinIO: {e}")
+        return None
 
-def load_rule_state(rule_name):
-    """Reads the JSON file from the app volume and pre-populates ALL widget keys in session state."""
-    safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
-    json_filepath = os.path.join("/", "app", "rules_ui_states", f"{safe_name}.json")
+def load_rule_state(rule_name, group_name):
+    """Reads the JSON from MinIO and pre-populates ALL widget keys in session state."""
+    state = load_ui_state(rule_name, group_name)
     
-    if os.path.exists(json_filepath):
-        with open(json_filepath, "r") as f:
-            state = json.load(f)
+    if state:
         
         # Step 1: Clear ALL old dynamic widget keys
         _clear_dynamic_widget_keys()
@@ -466,10 +477,8 @@ def load_rule_state(rule_name):
             if agg_data.get("alias"): st.session_state[f"agg_alias_{uid}"] = agg_data["alias"]
         
         # Step 11: Load Execution Strategy into Session State
-        st.session_state.execution_mode = state.get("execution_mode", "non_sequential")
         st.session_state.materialization = state.get("materialization", "table")
         st.session_state.sequence_order = state.get("sequence_order", 1)
-        st.session_state.parent_rule_id = state.get("parent_rule_id", "NULL")
         
         return True
     return False
@@ -506,8 +515,11 @@ def get_rules_for_approval(level_id):
 
 def read_dbt_sql(rule_name):
     """Reads the generated SQL file from the DBT folder."""
+    group_name = get_group_name_for_rule(rule_name)
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
-    filepath = os.path.join("/", "dbt", "formula1", "models", "rules", f"{safe_name}.sql")
+    
+    filepath = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group, f"{safe_name}.sql")
     try:
         if os.path.exists(filepath):
             with open(filepath, "r") as f:
@@ -584,32 +596,27 @@ def get_latest_rule_comment(rule_id):
 
 def create_final_rule_file(rule_name):
     """Copies the approved rule from /rules to /final_rules with the 'final_' prefix."""
+    group_name = get_group_name_for_rule(rule_name)
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
     
-    # Define exact paths based on your volume mapping
-    draft_path = os.path.join("/", "dbt", "formula1", "models", "rules", f"{safe_name}.sql")
-    final_dir = os.path.join("/", "dbt", "formula1", "models", "final_rules")
+    draft_path = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group, f"{safe_name}.sql")
+    
+    # --- UPDATE THIS LINE to include 'final_' in the folder name ---
+    final_dir = os.path.join("/", "dbt", "formula1", "models", "final_rules", f"final_{safe_group}")
+    
     final_path = os.path.join(final_dir, f"final_{safe_name}.sql")
 
     try:
-        # Step 1: Check if the source draft file actually exists
         if not os.path.exists(draft_path):
             return False, f"Source file not found at: {draft_path}"
-
-        # Step 2: Ensure the target directory exists
         os.makedirs(final_dir, exist_ok=True)
-
-        # Step 3: Copy the file
         shutil.copy2(draft_path, final_path)
         
-        # Step 4: Verify the copy was successful
         if os.path.exists(final_path):
             return True, f"✅ Success! File created at: {final_path}"
         else:
             return False, "Copy command executed, but file is missing."
-
-    except PermissionError:
-        return False, f"Permission Denied: Streamlit cannot write to {final_dir}"
     except Exception as e:
         return False, f"File creation error: {e}"
 
@@ -617,18 +624,22 @@ def execute_dbt_rule(rule_name):
     """Executes the finalized rule via Docker exec from within the Streamlit container."""
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
     
-    # --- NEW: Check execution mode from database ---
-    mode_sql = f"SELECT execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE rule_name = '{rule_name}'"
+    # --- FIXED: Join with rule_group to get the execution_mode ---
+    mode_sql = f"""
+    SELECT g.execution_mode 
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r
+    JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id
+    WHERE r.rule_name = '{rule_name}'
+    """
     mode_result = run_query(mode_sql)
     
     execution_mode = "non_sequential"
     if mode_result and len(mode_result) > 0 and mode_result[0][0]:
         execution_mode = mode_result[0][0]
     
-    # --- NEW: Append '+' if sequential to trigger DAG dependencies ---
+    # Append '+' if sequential to trigger DAG dependencies
     dbt_target = f"+final_{safe_name}" if execution_mode == 'sequential' else f"final_{safe_name}"
     
-    # We use 'shell=True' so Linux parses the whole string correctly.
     command = f'docker exec dbt bash -c "cd formula1 && dbt run --select {dbt_target}"'
     
     try:
@@ -649,6 +660,91 @@ def execute_dbt_rule(rule_name):
     except Exception as e:
         return False, f"System error calling Docker: {e}"
     
+def get_all_groups():
+    """Fetches all rule groups from the database."""
+    sql = f"SELECT group_id, group_name, execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group ORDER BY group_name ASC"
+    result = run_query(sql)
+    return result if result else []
+
+def get_next_group_id():
+    """Fetches the highest group_id from the database and adds 1."""
+    sql = f"SELECT MAX(group_id) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group"
+    result = run_query(sql)
+    if result and result[0][0] is not None:
+        return result[0][0] + 1
+    return 1
+
+def get_rules_by_group(group_id):
+    """Fetches existing rules that belong to a specific group."""
+    sql = f"SELECT rule_id, rule_name, sequence_order FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE group_id = {group_id} ORDER BY sequence_order ASC"
+    result = run_query(sql)
+    return result if result else []
+
+def get_group_name_for_rule(rule_name):
+    """Fetches the group_name for a given rule_name from the database."""
+    sql = f"""
+    SELECT g.group_name 
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r
+    JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id
+    WHERE r.rule_name = '{rule_name}'
+    """
+    result = run_query(sql)
+    return result[0][0] if result and len(result) > 0 else "ungrouped"
+
+def setup_new_group_environment(group_name):
+    """Creates physical folders and updates dbt_project.yml without losing comments."""
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    
+    # 1. Create Local DBT Folders
+    rules_dir = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group)
+    final_rules_dir = os.path.join("/", "dbt", "formula1", "models", "final_rules", f"final_{safe_group}")
+    
+    os.makedirs(rules_dir, exist_ok=True)
+    os.makedirs(final_rules_dir, exist_ok=True)
+    
+    # 2. Safely Update dbt_project.yml
+    yml_path = os.path.join("/", "dbt", "formula1", "dbt_project.yml")
+    if not os.path.exists(yml_path):
+        return False, "dbt_project.yml not found."
+        
+    with open(yml_path, 'r') as f:
+        lines = f.readlines()
+        
+    # The exact strings to inject
+    rules_str = f"      {safe_group}:\n        +schema: {safe_group}\n"
+    final_rules_str = f"\n      final_{safe_group}:\n        +schema: final_{safe_group}\n"
+    
+    # Prevent duplicate entries if a user tries to recreate a group
+    content_str = "".join(lines)
+    if rules_str in content_str:
+        return True, "Folders created; YAML already configured."
+        
+    new_lines = []
+    in_rules = False
+    in_final_rules = False
+    
+    for line in lines:
+        new_lines.append(line)
+        
+        # Inject under rules
+        if line.strip() == "rules:":
+            in_rules = True
+        elif in_rules and line.strip() == "+schema: rules":
+            new_lines.append(rules_str)
+            in_rules = False
+            
+        # Inject under final_rules
+        if line.strip() == "final_rules:":
+            in_final_rules = True
+        elif in_final_rules and line.strip() == "+schema: final_rules":
+            new_lines.append(final_rules_str)
+            in_final_rules = False
+            
+    # Write the updated lines back to the file
+    with open(yml_path, 'w') as f:
+        f.writelines(new_lines)
+        
+    return True, "Folders and YAML updated successfully."
 
 
 
@@ -776,7 +872,12 @@ else:
             
             # If Iceberg didn't find it (because it's ephemeral), build its schema from JSON!
             if target_model_name not in TABLE_SCHEMAS:
-                state = load_ui_state(rule_nm)
+                
+                # --- FIXED: Fetch the group name dynamically before loading UI state ---
+                rule_group_name = get_group_name_for_rule(rule_nm)
+                state = load_ui_state(rule_nm, rule_group_name)
+                # ---------------------------------------------------------------------
+                
                 if state:
                     # Reconstruct the expected output columns
                     simulated_cols = state.get("primary_columns", [])
@@ -1031,15 +1132,22 @@ else:
                         # 2. Delete the rule from the main table
                         if run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE rule_id = {sel_rule_id}"):
                             
-                            # 3. Physically delete the generated files from the Docker volumes
+                            # 3. Physically delete the generated files
+                            group_name = get_group_name_for_rule(sel_rule_name)
+                            safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
                             safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', sel_rule_name.lower())
-                            sql_path = os.path.join("/", "dbt", "formula1", "models", "rules", f"{safe_name}.sql")
-                            json_path = os.path.join("/", "app", "rules_ui_states", f"{safe_name}.json")
                             
+                            # Delete SQL file from DBT Volume
+                            sql_path = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group, f"{safe_name}.sql")
                             if os.path.exists(sql_path): 
                                 os.remove(sql_path)
-                            if os.path.exists(json_path): 
-                                os.remove(json_path)
+                                
+                            # Delete JSON State from MinIO
+                            try:
+                                s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+                                s3_client.delete_object(Bucket=MINIO_BUCKET, Key=f"ui_states/{safe_group}/{safe_name}.json")
+                            except Exception as e:
+                                st.warning(f"Note: Could not delete UI state from MinIO: {e}")
                                 
                             st.error(f"Rule ID {sel_rule_id} and its associated files have been permanently deleted.")
                             time.sleep(1.5)
@@ -1099,198 +1207,247 @@ else:
         
     elif role == "CREATOR":
         # --- MAIN QUERY BUILDER AREA ---
-        st.title("Build Your Rule Data Flow")
+        st.title("Rule Registry: Manage Business Logic")
         
-        # 1. Source & Selection
+        # Initialize session state for UI toggles
+        if "create_new_group" not in st.session_state:
+            st.session_state.create_new_group = False
+        if "active_group_id" not in st.session_state:
+            st.session_state.active_group_id = None
+        
+        # ---------------------------------------------------------
+        # 1. RULE CONTEXT & GROUPING (Matches your Mockup)
+        # ---------------------------------------------------------
         with st.container(border=True):
-            st.markdown("#### 1. Source & Selection")
+            st.markdown("#### 1. Rule Context & Grouping")
             
-            # Display the next auto-incremented ID
-            # Replace the existing Rule ID and Name section with this:
-            action_mode = st.radio("Action:", ["Create New Rule", "Update Existing Rule"], horizontal=True)
+            col1, col2 = st.columns([8, 2])
             
-            if action_mode == "Create New Rule":
-                st.session_state.currently_loaded_rule = None
-                current_id = get_next_rule_id()
-                st.info(f"🆕 Creating Rule ID: **{current_id}**")
-                r_name = st.text_input("Rule Name (Compulsory)", placeholder="e.g., Driver Standings 2023 Analysis")
-                # --- ADD THIS BELOW THE RULE NAME INPUT ---
-                # --- START EXECUTION STRATEGY UI ---
-                st.markdown("#### Execution Strategy")
-                
-                # Safely load saved modes or default to standard
-                loaded_exec = st.session_state.get("execution_mode", "non_sequential")
-                exec_opts = ["non_sequential", "sequential"]
-                exec_idx = exec_opts.index(loaded_exec) if loaded_exec in exec_opts else 0
-                
-                execution_mode = st.radio("Execution Mode:", exec_opts, horizontal=True, index=exec_idx, key="exec_mode_widget")
-
-                loaded_mat = st.session_state.get("materialization", "table")
-                mat_opts = ["ephemeral", "table"]
-                mat_idx = mat_opts.index(loaded_mat) if loaded_mat in mat_opts else 1
-                
-                materialization = st.radio(
-                    "Materialization (Database Save Type):", 
-                    mat_opts, 
-                    horizontal=True, 
-                    index=mat_idx,
-                    key="mat_widget",
-                    help="Select 'ephemeral' for intermediate steps to compile as CTEs. Select 'table' for your final output."
-                )
-
-                sequence_order = 0
-                parent_rule_id = "NULL"
-
-                if execution_mode == "sequential":
-                    col_seq1, col_seq2 = st.columns(2)
-                    with col_seq1:
-                        loaded_seq = st.session_state.get("sequence_order", 1)
-                        sequence_order = st.number_input("Sequence Order (e.g., 1, 2, 3)", min_value=1, step=1, value=int(loaded_seq), key="seq_ord_widget")
-                    with col_seq2:
-                        existing_rules = get_existing_rules()
-                        rule_options = {"None (First in Sequence)": "NULL"}
-                        if existing_rules:
-                            for r in existing_rules:
-                                rule_options[f"ID: {r[0]} - {r[1]}"] = r[0]
+            with col1:
+                if not st.session_state.create_new_group:
+                    # EXISTING GROUP DROPDOWN
+                    groups = get_all_groups()
+                    if groups:
+                        group_dict = {f"{g[1]} ({g[2]})": g for g in groups}
+                        selected_group_label = st.selectbox("Select Rule Group:", list(group_dict.keys()))
+                        active_group = group_dict[selected_group_label]
+                        
+                        # Store the active group in state
+                        st.session_state.active_group_id = active_group[0]
+                        st.session_state.active_group_name = active_group[1]
+                        st.session_state.active_group_mode = active_group[2]
+                    else:
+                        st.info("No groups found. Please create a new group.")
+                        st.session_state.active_group_id = None
+                else:
+                    # NEW GROUP CREATION FORM
+                    st.info("🆕 Creating a New Rule Group")
+                    new_g_name = st.text_input("New Group Name:", placeholder="e.g., Fraud_Risk_Scoring")
+                    new_g_mode = st.radio("Execution Mode:", ["non_sequential", "sequential"], horizontal=True)
+            
+            with col2:
+                st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
+                if not st.session_state.create_new_group:
+                    if st.button("➕ New Group", use_container_width=True):
+                        st.session_state.create_new_group = True
+                        st.rerun()
+                else:
+                    if st.button("💾 Save Group", type="primary", use_container_width=True):
+                        if new_g_name:
+                            new_id = get_next_group_id()
+                            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            # Grab the username from the active session
+                            current_user = user['username']
+                            
+                            # UPDATED SQL: Removed 'status', added 'created_by' to match your schema
+                            sql = f"""
+                            INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group 
+                            (group_id, group_name, execution_mode, created_by, created_at) 
+                            VALUES 
+                            ({new_id}, '{new_g_name}', '{new_g_mode}', '{current_user}', CAST('{now}' AS TIMESTAMP))
+                            """
+                            
+                            if run_update(sql):
+                                # Setup the DBT environment
+                                success, msg = setup_new_group_environment(new_g_name)
                                 
-                        loaded_parent = st.session_state.get("parent_rule_id", "NULL")
-                        parent_keys = list(rule_options.keys())
-                        parent_vals = list(rule_options.values())
-                        p_idx = parent_vals.index(loaded_parent) if loaded_parent in parent_vals else 0
-                        
-                        parent_selection = st.selectbox("Depends on Parent Rule:", parent_keys, index=p_idx, key="parent_rule_widget")
-                        parent_rule_id = rule_options[parent_selection]
-                # --- END EXECUTION STRATEGY UI ---
-            else:
-                existing_rules = get_existing_rules()
-                if existing_rules:
-                    rule_dict = {row[1]: row[0] for row in existing_rules}
-                    selected_rule = st.selectbox("Select Rule to Update:", list(rule_dict.keys()), key="rule_selector")
-                    current_id = rule_dict[selected_rule]
-                    st.info(f"🔄 Updating Rule ID: **{current_id}**")
-                    r_name = st.text_input("Rule Name", value=selected_rule, disabled=True)
+                                if success:
+                                    st.success(f"Group created! {msg}")
+                                else:
+                                    st.warning(f"Group saved to DB, but env setup failed: {msg}")
+                                
+                                st.session_state.create_new_group = False
+                                time.sleep(1.5)
+                                st.rerun()
+                        else:
+                            st.error("Group Name required.")
 
-                    # --- NEW: DISPLAY LATEST COMMENT ---
-                    latest_approval = get_latest_rule_comment(current_id)
-                    if latest_approval:
-                        act, cmt, uname, lvl = latest_approval
-                        level_names = {1: "Manager", 2: "Technical", 3: "SME"}
-                        lvl_name = level_names.get(lvl, f"Level {lvl}")
-                        reviewer = uname if uname else "System"
-                        
-                        if act == 'REJECTED':
-                            st.error(f"❌ **REJECTED by {reviewer} ({lvl_name})**\n\n**Feedback:** {cmt}")
-                        elif act == 'APPROVED':
-                            st.success(f"✅ **APPROVED by {reviewer} ({lvl_name})**\n\n**Comments:** {cmt}")
-                        else:
-                            st.info(f"⏳ **PENDING at {lvl_name}**\n\n**Latest Note:** {cmt}")
-                    # -----------------------------------
+                    if st.button("Cancel", use_container_width=True):
+                        st.session_state.create_new_group = False
+                        st.rerun()
 
-                    # Load state cleanly
-                    if st.session_state.get("last_selected_rule") != selected_rule:
-                        st.session_state.last_selected_rule = selected_rule
-                        if load_rule_state(selected_rule):
-                            st.rerun()
-                else:
-                    st.warning("No existing rules found.")
-                    current_id = None
-                    r_name = ""
-            # st.info(f"🆕 Creating Rule ID: **{next_id}**")
-            
-            # r_name = st.text_input("Rule Name (Compulsory)", placeholder="e.g., Driver Standings 2023 Analysis")
-            
-            col1, col2 = st.columns([1, 1])
-        with col1:
-            # with col1:
-            # Check if the widget's key is already populated from the loaded JSON
-            if "t1" in st.session_state:
-                t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, key="t1")
-            else:
-                t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, index=0, key="t1")
-            
-            st.markdown("**Joins Configuration**")
-            joins_to_remove = []
-            available_left_tables = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
-
-            for i, join_data in enumerate(st.session_state.joins):
-                uid = join_data["id"]
-                st.markdown(f"**Join {i+1}**")
+        # ---------------------------------------------------------
+        # 2. RULE DEFINITIONS (Only show if a group is selected)
+        # ---------------------------------------------------------
+        if st.session_state.active_group_id and not st.session_state.create_new_group:
+            with st.container(border=True):
+                st.markdown(f"#### 2. Rule Definitions for: {st.session_state.active_group_name}")
                 
-                t_right_key = f"t_right_{uid}"
-                if t_right_key in st.session_state:
-                    join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, key=t_right_key)
-                else:
-                    right_table_idx = safe_index(TABLE_NAMES, join_data.get("right_table"))
-                    join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, index=right_table_idx, key=t_right_key)
+                action_mode = st.radio("Action:", ["Create New Rule", "Update Existing Rule"], horizontal=True)
                 
-                join_types = ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "FULL OUTER JOIN", "CROSS JOIN"]
-                j_type_key = f"j_type_{uid}"
-                if j_type_key in st.session_state:
-                    join_data["join_type"] = st.selectbox("Join Type:", join_types, key=j_type_key)
-                else:
-                    join_type_idx = safe_index(join_types, join_data.get("join_type"))
-                    join_data["join_type"] = st.selectbox("Join Type:", join_types, index=join_type_idx, key=j_type_key)
-                
-                if join_data["join_type"] != "CROSS JOIN":
-                    sub_col1, sub_col2 = st.columns(2)
-                    with sub_col1:
-                        left_tbl_opts = available_left_tables[:i+1]
-                        l_tbl_key = f"l_tbl_{uid}"
-                        if l_tbl_key in st.session_state:
-                            join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, key=l_tbl_key)
-                        else:
-                            left_tbl_idx = safe_index(left_tbl_opts, join_data.get("left_table"))
-                            join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, index=left_tbl_idx, key=l_tbl_key)
-                        
-                        l_table_actual = join_data["left_table"] if join_data["left_table"] else t1
-                        l_cols = TABLE_SCHEMAS.get(l_table_actual, [])
-                        l_col_key = f"l_col_{uid}"
-                        if l_col_key in st.session_state:
-                            join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, key=l_col_key)
-                        else:
-                            left_col_idx = safe_index(l_cols, join_data.get("left_col"))
-                            join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, index=left_col_idx, key=l_col_key)
-                    with sub_col2:
-                        r_table_actual = join_data["right_table"]
-                        r_cols = TABLE_SCHEMAS.get(r_table_actual, [])
-                        r_col_key = f"r_col_{uid}"
-                        if r_col_key in st.session_state:
-                            join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, key=r_col_key)
-                        else:
-                            right_col_idx = safe_index(r_cols, join_data.get("right_col"))
-                            join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, index=right_col_idx, key=r_col_key)
-                
-                if st.button("➖ Remove Join", key=f"rm_j_{uid}"):
-                    joins_to_remove.append(i)
-                st.divider()
+                if action_mode == "Create New Rule":
+                    st.session_state.currently_loaded_rule = None
+                    current_id = get_next_rule_id()
+                    st.info(f"🆕 Creating Rule ID: **{current_id}**")
+                    r_name = st.text_input("Rule Name (Compulsory)", placeholder="e.g., fraud_check_amount")
                     
-            for index in sorted(joins_to_remove, reverse=True):
-                st.session_state.joins.pop(index)
-                st.rerun()
+                else:
+                    # UPDATE EXISTING RULE (Filtered by active group)
+                    group_rules = get_rules_by_group(st.session_state.active_group_id)
+                    if group_rules:
+                        rule_dict = {f"ID: {row[0]} - {row[1]}": row[0] for row in group_rules}
+                        selected_rule_label = st.selectbox("Select Rule to Update:", list(rule_dict.keys()), key="rule_selector")
+                        current_id = rule_dict[selected_rule_label]
+                        st.info(f"🔄 Updating Rule ID: **{current_id}**")
+                        
+                        # Extract just the name for the input field
+                        selected_rule_name = [r[1] for r in group_rules if r[0] == current_id][0]
+                        r_name = st.text_input("Rule Name", value=selected_rule_name, disabled=True)
+                        
+                        # Load state cleanly
+                        if st.session_state.get("last_selected_rule") != selected_rule_name:
+                            st.session_state.last_selected_rule = selected_rule_name
+                            if load_rule_state(selected_rule_name, st.session_state.active_group_name):
+                                st.rerun()
+                    else:
+                        st.warning(f"No existing rules found in '{st.session_state.active_group_name}'.")
+                        current_id = None
+                        r_name = ""
 
-            if st.button("➕ Add Join"):
-                st.session_state.joins.append({
-                    "id": str(uuid.uuid4()), "right_table": "", "join_type": "LEFT JOIN", 
-                    "left_table": "", "left_col": "", "right_col": ""
-                })
-                st.rerun()
-
-        with col2:
-            primary_cols_key = f"primary_cols_{t1}"
-            if primary_cols_key not in st.session_state:
-                st.session_state[primary_cols_key] = TABLE_SCHEMAS.get(t1, [])[:3]
-            
-            cols_t1 = st.multiselect(f"Output Columns for {t1}:", TABLE_SCHEMAS.get(t1, []), key=primary_cols_key)
-            
-            cols_joins = {}
-            for join_data in st.session_state.joins:
-                r_table = join_data.get("right_table")
-                if r_table and r_table not in cols_joins:
-                    out_col_key = f"out_col_{r_table}"
-                    if out_col_key not in st.session_state:
-                        st.session_state[out_col_key] = TABLE_SCHEMAS.get(r_table, [])[:3]
+                # --- CONDITIONAL SEQUENCE & MATERIALIZATION INPUT ---
+                # This now applies to both Create and Update!
+                if r_name or action_mode == "Create New Rule":
+                    st.divider()
                     
-                    cols_joins[r_table] = st.multiselect(f"Output Columns for {r_table}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key)
+                    col_mat1, col_mat2 = st.columns(2)
+                    with col_mat1:
+                        if st.session_state.active_group_mode == 'sequential':
+                            st.markdown("**Sequential Execution Setup**")
+                            loaded_seq = st.session_state.get("sequence_order", 1)
+                            sequence_order = st.number_input("Sequence Order (e.g., 1000, 2000, 3000)", min_value=1, step=1, value=int(loaded_seq))
+                        else:
+                            st.info("ℹ️ Group is non-sequential. All rules run in parallel.")
+                            sequence_order = 0
+                            
+                    with col_mat2:
+                        loaded_mat = st.session_state.get("materialization", "table")
+                        mat_opts = ["ephemeral", "table"]
+                        mat_idx = mat_opts.index(loaded_mat) if loaded_mat in mat_opts else 1
+                        materialization = st.radio("Materialization (Database Save Type):", mat_opts, horizontal=True, index=mat_idx)
+            # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # 3 & 4. DATA SOURCES, JOINS & OUTPUT COLUMNS (50-50 Split)
+        # ---------------------------------------------------------
+        col_src1, col_src2 = st.columns(2)
+        
+        with col_src1:
+            with st.container(border=True):
+                st.markdown("#### 3. Data Sources & Joins")
+                
+                # Check if the widget's key is already populated from the loaded JSON
+                if "t1" in st.session_state:
+                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, key="t1")
+                else:
+                    t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, index=0, key="t1")
+                
+                st.markdown("**Joins Configuration**")
+                joins_to_remove = []
+                available_left_tables = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
+
+                for i, join_data in enumerate(st.session_state.joins):
+                    uid = join_data["id"]
+                    st.markdown(f"**Join {i+1}**")
+                    
+                    t_right_key = f"t_right_{uid}"
+                    if t_right_key in st.session_state:
+                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, key=t_right_key)
+                    else:
+                        right_table_idx = safe_index(TABLE_NAMES, join_data.get("right_table"))
+                        join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, index=right_table_idx, key=t_right_key)
+                    
+                    join_types = ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "FULL OUTER JOIN", "CROSS JOIN"]
+                    j_type_key = f"j_type_{uid}"
+                    if j_type_key in st.session_state:
+                        join_data["join_type"] = st.selectbox("Join Type:", join_types, key=j_type_key)
+                    else:
+                        join_type_idx = safe_index(join_types, join_data.get("join_type"))
+                        join_data["join_type"] = st.selectbox("Join Type:", join_types, index=join_type_idx, key=j_type_key)
+                    
+                    if join_data["join_type"] != "CROSS JOIN":
+                        sub_col1, sub_col2 = st.columns(2)
+                        with sub_col1:
+                            left_tbl_opts = available_left_tables[:i+1]
+                            l_tbl_key = f"l_tbl_{uid}"
+                            if l_tbl_key in st.session_state:
+                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, key=l_tbl_key)
+                            else:
+                                left_tbl_idx = safe_index(left_tbl_opts, join_data.get("left_table"))
+                                join_data["left_table"] = st.selectbox("Join to Table:", left_tbl_opts, index=left_tbl_idx, key=l_tbl_key)
+                            
+                            l_table_actual = join_data["left_table"] if join_data["left_table"] else t1
+                            l_cols = TABLE_SCHEMAS.get(l_table_actual, [])
+                            l_col_key = f"l_col_{uid}"
+                            if l_col_key in st.session_state:
+                                join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, key=l_col_key)
+                            else:
+                                left_col_idx = safe_index(l_cols, join_data.get("left_col"))
+                                join_data["left_col"] = st.selectbox(f"Column in {l_table_actual}:", l_cols, index=left_col_idx, key=l_col_key)
+                        with sub_col2:
+                            r_table_actual = join_data["right_table"]
+                            r_cols = TABLE_SCHEMAS.get(r_table_actual, [])
+                            r_col_key = f"r_col_{uid}"
+                            if r_col_key in st.session_state:
+                                join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, key=r_col_key)
+                            else:
+                                right_col_idx = safe_index(r_cols, join_data.get("right_col"))
+                                join_data["right_col"] = st.selectbox(f"Column in {r_table_actual}:", r_cols, index=right_col_idx, key=r_col_key)
+                    
+                    if st.button("➖ Remove Join", key=f"rm_j_{uid}"):
+                        joins_to_remove.append(i)
+                    st.divider()
+                        
+                for index in sorted(joins_to_remove, reverse=True):
+                    st.session_state.joins.pop(index)
+                    st.rerun()
+
+                if st.button("➕ Add Join"):
+                    st.session_state.joins.append({
+                        "id": str(uuid.uuid4()), "right_table": "", "join_type": "LEFT JOIN", 
+                        "left_table": "", "left_col": "", "right_col": ""
+                    })
+                    st.rerun()
+
+        with col_src2:
+            with st.container(border=True):
+                st.markdown("#### 4. Output Columns Selection")
+                st.caption("Select the columns you want to pass through to the final rule output.")
+                
+                primary_cols_key = f"primary_cols_{t1}"
+                if primary_cols_key not in st.session_state:
+                    st.session_state[primary_cols_key] = TABLE_SCHEMAS.get(t1, [])[:3]
+                
+                cols_t1 = st.multiselect(f"Output Columns for {t1}:", TABLE_SCHEMAS.get(t1, []), key=primary_cols_key)
+                
+                cols_joins = {}
+                for join_data in st.session_state.joins:
+                    r_table = join_data.get("right_table")
+                    if r_table and r_table not in cols_joins:
+                        out_col_key = f"out_col_{r_table}"
+                        if out_col_key not in st.session_state:
+                            st.session_state[out_col_key] = TABLE_SCHEMAS.get(r_table, [])[:3]
+                        
+                        cols_joins[r_table] = st.multiselect(f"Output Columns for {r_table}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key)
 
         available_columns = [f"{t1}.{c}" for c in TABLE_SCHEMAS.get(t1, [])]
         for r_table in cols_joins.keys():
@@ -1538,109 +1695,6 @@ else:
         # 4. Preview & Run
         with st.container(border=True):
             st.markdown("#### 4. Preview & Run")
-            
-            # all_tables_in_query = [t1] + [j.get("right_table") for j in st.session_state.joins if j.get("right_table")]
-            # unique_tables = list(dict.fromkeys(all_tables_in_query)) 
-            
-            # cte_clauses = [f"{tbl} AS (\n    SELECT * FROM {{{{ ref('{tbl}') }}}}\n)" for tbl in unique_tables]
-            # cte_block = "WITH " + ",\n".join(cte_clauses) if cte_clauses else ""
-            
-            # non_agg_cols = [f"{t1}.{c}" for c in cols_t1]
-            # for r_table, cols in cols_joins.items():
-            #     non_agg_cols.extend([f"{r_table}.{c}" for c in cols])
-            
-            # agg_expressions = []
-            # has_valid_aggregations = False
-            # for agg in st.session_state.aggregations:
-            #     if agg.get('col') and agg.get('func'):
-            #         has_valid_aggregations = True
-            #         agg_expr = f"{agg['func']}({agg['col']})"
-            #         if agg.get('alias'):
-            #             agg_expr += f" AS {agg['alias']}"
-            #         agg_expressions.append(agg_expr)
-            
-            # all_select_cols = non_agg_cols + agg_expressions
-            # select_clause = "SELECT\n    " + (",\n    ".join(all_select_cols) if all_select_cols else "*")
-            
-            # from_clause = f"FROM {t1}"
-            
-            # for join_data in st.session_state.joins:
-            #     r_table = join_data.get("right_table")
-            #     if not r_table: 
-            #         continue
-                    
-            #     j_type = join_data["join_type"]
-                
-            #     if j_type == "CROSS JOIN":
-            #         from_clause += f"\nCROSS JOIN {r_table}"
-            #     else:
-            #         l_table = join_data["left_table"] if join_data["left_table"] else t1
-            #         l_col = join_data["left_col"]
-            #         r_col = join_data["right_col"]
-            #         from_clause += f"\n{j_type} {r_table}\n  ON {l_table}.{l_col} = {r_table}.{r_col}"
-
-            # where_clauses = []
-            # for i, f in enumerate(st.session_state.where_filters):
-            #     if f['col']:
-            #         logic = f"{f['logic']} " if i > 0 else ""
-                    
-            #         op_map = {
-            #             "equals (=)": "=", "greater than (>)": ">", "less than (<)": "<", 
-            #             "not equals (!=)": "!=", "greater than equal (>=)": ">=", 
-            #             "less than equal (<=)": "<=", "LIKE": "LIKE", "NOT LIKE": "NOT LIKE", 
-            #             "IN": "IN", "NOT IN": "NOT IN", "BETWEEN": "BETWEEN",
-            #             "IS": "IS", "IS NOT": "IS NOT", "IS NULL": "IS NULL", "IS NOT NULL": "IS NOT NULL"
-            #         }
-            #         op_sql = op_map.get(f['op'], "=")
-                    
-            #         if f['op'] in ["IS NULL", "IS NOT NULL"]:
-            #             where_clauses.append(f"{logic}{f['col']} {op_sql}")
-            #         elif f['op'] == "BETWEEN" and f.get('val') and f.get('val2'):
-            #             v1 = f['val'] if is_numeric_literal(f['val']) else f"'{f['val']}'"
-            #             v2 = f['val2'] if is_numeric_literal(f['val2']) else f"'{f['val2']}'"
-            #             where_clauses.append(f"{logic}{f['col']} BETWEEN {v1} AND {v2}")
-            #         elif f.get('val') and f['op'] not in ["BETWEEN", "IS NULL", "IS NOT NULL"]:
-            #             is_unquoted = f['op'] in ["IN", "NOT IN", "IS", "IS NOT"] or f['val'].upper() in ("NULL", "TRUE", "FALSE")
-            #             val = f['val'] if is_unquoted or is_numeric_literal(f['val']) else f"'{f['val']}'"
-            #             where_clauses.append(f"{logic}{f['col']} {op_sql} {val}")
-
-            # where_clause = ("\nWHERE " + "\n  ".join(where_clauses)) if where_clauses else ""
-
-            # having_clauses = []
-            # for i, h in enumerate(st.session_state.having_filters):
-            #     if h.get('func') and h.get('col') and h.get('op') and h.get('val'):
-            #         logic = f"{h.get('logic', 'AND')} " if i > 0 else ""
-            #         h_value = str(h['val']).strip()
-            #         h_sql_val = h_value if is_numeric_literal(h_value) else f"'{h_value}'"
-            #         having_clauses.append(f"{logic}{h['func']}({h['col']}) {h['op']} {h_sql_val}")
-
-            # having_clause = ("\nHAVING " + "\n  ".join(having_clauses)) if having_clauses else ""
-
-            # group_by_clause = ""
-            # manual_gb = st.session_state.get("manual_group_by", [])
-            
-            # # Combine automatically required group by columns and manually added ones
-            # all_group_by_cols = non_agg_cols + manual_gb
-            
-            # # Trigger GROUP BY if we have aggregations/having OR if the user manually selected something
-            # if all_group_by_cols and (has_valid_aggregations or having_clauses or manual_gb):
-            #     # dict.fromkeys removes duplicates just in case, while preserving order
-            #     unique_gb_cols = list(dict.fromkeys(all_group_by_cols))
-            #     group_by_clause = "\nGROUP BY " + ", ".join(unique_gb_cols)
-
-            # order_clauses = []
-            # for f in st.session_state.order_filters:
-            #     if f['col']:
-            #         order_clauses.append(f"{f['col']} {f['dir']}")
-
-            # order_clause = ("\nORDER BY " + ", ".join(order_clauses)) if order_clauses else ""
-
-            # limit_clause = ""
-            # row_limit_value = st.session_state.get("row_limit", None)
-            # if isinstance(row_limit_value, (int, float)) and int(row_limit_value) > 0:
-            #     limit_clause = f"\nLIMIT {int(row_limit_value)}"
-
-            # generated_sql = f"{cte_block}\n\n{select_clause}\n{from_clause}{where_clause}{group_by_clause}{having_clause}{order_clause}{limit_clause}"
 
             # --- START OF MACRO GENERATION LOGIC ---
             # 1. Tables
@@ -1741,6 +1795,7 @@ else:
                         safe_sql = generated_sql.replace("'", "''")
                         
                         try:
+                            # 1. Save UI State (Cleaned of deprecated keys)
                             ui_state = {
                                 "primary_table": t1,
                                 "primary_columns": cols_t1,
@@ -1752,37 +1807,25 @@ else:
                                 "row_limit": st.session_state.row_limit,
                                 "where_filters": st.session_state.where_filters,
                                 "order_filters": st.session_state.order_filters,
-                                # --- NEW: Save Execution Strategy to JSON ---
-                                "execution_mode": execution_mode,
                                 "materialization": materialization,
-                                "sequence_order": sequence_order,
-                                "parent_rule_id": parent_rule_id
+                                "sequence_order": sequence_order
                             }
                             
                             # Save SQL to /dbt/
-                            dbt_filepath = save_dbt_model(r_name, generated_sql)
+                            dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
                             
                             # Save JSON to /app/
-                            save_ui_state(r_name, ui_state)
-
-                            # Define the target model name (sanitized rule name)
-                            target_model = re.sub(r'[^a-zA-Z0-9_]', '_', r_name.lower())
-                            
-                            # Grab values from the UI (ensure you added these Streamlit widgets as discussed previously)
-                            # Fallbacks to defaults if the UI widgets aren't interacted with yet
-                            exec_mode = locals().get('execution_mode', 'non_sequential')
-                            seq_ord = locals().get('sequence_order', 0)
-                            p_rule_id = locals().get('parent_rule_id', 'NULL')
+                            save_ui_state(r_name, st.session_state.active_group_name, ui_state)
 
                             if action_mode == "Create New Rule":
                                 final_insert_id = get_next_rule_id() 
                                 db_query = f"""
                                 INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
-                                (rule_id, rule_name, status, created_by, created_at, updated_at, execution_mode, sequence_order, parent_rule_id, target_model_name)
+                                (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id)
                                 VALUES (
                                     {final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', 
                                     CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP),
-                                    '{exec_mode}', {seq_ord}, {p_rule_id}, '{target_model}'
+                                    {sequence_order}, {st.session_state.active_group_id}
                                 )
                                 """
                             else:
@@ -1791,10 +1834,8 @@ else:
                                 UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
                                 SET status = 'IN_REVIEW',
                                     updated_at = CAST('{now}' AS TIMESTAMP),
-                                    execution_mode = '{exec_mode}',
-                                    sequence_order = {seq_ord},
-                                    parent_rule_id = {p_rule_id},
-                                    target_model_name = '{target_model}'
+                                    sequence_order = {sequence_order},
+                                    group_id = {st.session_state.active_group_id}
                                 WHERE rule_id = {final_insert_id}
                                 """
                             
