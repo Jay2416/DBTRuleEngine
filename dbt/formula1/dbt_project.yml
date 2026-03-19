@@ -39,12 +39,17 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      all_time_wins_leaderboard:
+        +schema: all_time_wins_leaderboard
       testing_group:
         +schema: testing_group
       championship_standings_2023:
         +schema: championship_standings_2023
     final_rules:
       +schema: final_rules
+
+      final_all_time_wins_leaderboard:
+        +schema: final_all_time_wins_leaderboard
 
       final_testing_group:
         +schema: final_testing_group

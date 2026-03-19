@@ -316,13 +316,28 @@ def get_next_rule_id():
     # If the table is completely empty, start at 1
     return 1
 
-def get_existing_rules():
-    """Fetches existing ACTIVE rules from the database to use as data sources."""
-    # Added WHERE status = 'ACTIVE' so only approved rules can be selected as sources
-    sql = f"SELECT rule_id, rule_name FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE status = 'ACTIVE' ORDER BY rule_id ASC"
-    
+def get_existing_rules(group_id=None):
+    """Fetch rules (optionally by group) and return display model names by status.
+
+    ACTIVE rules are exposed as final_<rule_name>; all others use draft model names.
+    """
+    base_sql = f"SELECT rule_id, rule_name, status FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow"
+    if group_id is not None:
+        sql = f"{base_sql} WHERE group_id = {int(group_id)} ORDER BY rule_id ASC"
+    else:
+        sql = f"{base_sql} ORDER BY rule_id ASC"
+
     result = run_query(sql)
-    return result if result else []
+    if not result:
+        return []
+
+    mapped_rules = []
+    for rule_id, rule_name, status in result:
+        safe_name = safe_model_name(rule_name)
+        model_name = f"final_{safe_name}" if status == "ACTIVE" else safe_name
+        mapped_rules.append((rule_id, rule_name, status, model_name))
+
+    return mapped_rules
 
 def save_dbt_model(rule_name, group_name, sql_content):
     """Saves the SQL query directly to the shared DBT container volume inside a group folder."""
@@ -583,13 +598,31 @@ def process_approval(approval_id, rule_id, rule_name, level_id, user_id, action,
     elif action == 'APPROVED':
         if level_id < 3:
             next_level = level_id + 1
-            next_app_id = get_next_approval_id()
-            ins_sql = f"""
-            INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
-            (approval_id, rule_id, user_id, level_id, action, comments, action_date)
-            VALUES ({next_app_id}, {rule_id}, NULL, {next_level}, 'PENDING', 'Awaiting Level {next_level} review.', CAST('{now}' AS TIMESTAMP))
+            existing_next_sql = f"""
+            SELECT approval_id
+            FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+            WHERE rule_id = {rule_id} AND level_id = {next_level}
+            ORDER BY approval_id DESC
+            LIMIT 1
             """
-            run_update(ins_sql)
+            existing_next = run_query(existing_next_sql)
+
+            if existing_next and len(existing_next) > 0:
+                next_approval_id = existing_next[0][0]
+                reuse_sql = f"""
+                UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+                SET action = 'PENDING', comments = 'Awaiting Level {next_level} review.', user_id = NULL, action_date = CAST('{now}' AS TIMESTAMP)
+                WHERE approval_id = {next_approval_id}
+                """
+                run_update(reuse_sql)
+            else:
+                next_app_id = get_next_approval_id()
+                ins_sql = f"""
+                INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+                (approval_id, rule_id, user_id, level_id, action, comments, action_date)
+                VALUES ({next_app_id}, {rule_id}, NULL, {next_level}, 'PENDING', 'Awaiting Level {next_level} review.', CAST('{now}' AS TIMESTAMP))
+                """
+                run_update(ins_sql)
             return True, "Rule routed forward."
         else:
             # Level 3 (SME) approved it -> Rule is now ACTIVE
@@ -715,6 +748,155 @@ def get_rules_by_group(group_id):
     sql = f"SELECT rule_id, rule_name, sequence_order FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE group_id = {group_id} ORDER BY sequence_order ASC"
     result = run_query(sql)
     return result if result else []
+
+def get_group_rules_for_sequence(group_id, exclude_rule_id=None):
+    """Return rules sorted by internal sequence for sequence-planning operations."""
+    rows = get_rules_by_group(group_id)
+    normalized = []
+    for rule_id, rule_name, sequence_order in rows:
+        if exclude_rule_id is not None and rule_id == exclude_rule_id:
+            continue
+        normalized.append({
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "sequence_order": int(sequence_order or 0)
+        })
+    normalized.sort(key=lambda x: x["sequence_order"])
+    return normalized
+
+def map_rules_to_visual_sequence(sorted_rules):
+    """Map sorted internal sequence rows to a 1-based visual sequence for the UI."""
+    mapped = []
+    for idx, item in enumerate(sorted_rules, start=1):
+        mapped.append({
+            "visual_sequence": idx,
+            "rule_id": item["rule_id"],
+            "rule_name": item["rule_name"],
+            "sequence_order": item["sequence_order"]
+        })
+    return mapped
+
+def get_rule_visual_position(group_id, rule_id):
+    """Get current 1-based visual position for a rule in its group."""
+    mapped = map_rules_to_visual_sequence(get_group_rules_for_sequence(group_id))
+    for row in mapped:
+        if row["rule_id"] == rule_id:
+            return row["visual_sequence"]
+    return len(mapped) + 1
+
+def calculate_sequence_plan(sorted_rules, target_visual_sequence, moving_rule):
+    """Calculate sequence updates for insert/move operations.
+
+    Scenario A: append/no collision -> internal = target * 1000
+    Scenario B: collision at visual position > 1 -> floor(avg(prev, current))
+    Scenario C: insert at visual 1 -> full reindex to 1000 steps
+    Rebalance fallback: if there is no gap between adjacent values, full reindex.
+    """
+    base = list(sorted_rules)
+    target = max(1, int(target_visual_sequence))
+
+    # Scenario C: insert/move to first position with full reindex.
+    if target == 1:
+        ordered = [moving_rule] + base
+        batch_updates = []
+        for idx, row in enumerate(ordered, start=1):
+            batch_updates.append({
+                "rule_id": row["rule_id"],
+                "rule_name": row["rule_name"],
+                "sequence_order": idx * 1000,
+                "visual_sequence": idx
+            })
+        return {
+            "scenario": "C",
+            "mode": "batch",
+            "new_sequence_order": 1000,
+            "batch_updates": batch_updates
+        }
+
+    # Scenario A: append or position beyond current max visual index.
+    if target > len(base):
+        return {
+            "scenario": "A",
+            "mode": "single",
+            "new_sequence_order": target * 1000,
+            "batch_updates": []
+        }
+
+    # Scenario B: collision at an existing visual index > 1.
+    prev_seq = int(base[target - 2]["sequence_order"])
+    curr_seq = int(base[target - 1]["sequence_order"])
+
+    # If no integer gap exists, rebalance the entire ordering to 1000 increments.
+    if curr_seq - prev_seq <= 1:
+        ordered = base[:target - 1] + [moving_rule] + base[target - 1:]
+        batch_updates = []
+        for idx, row in enumerate(ordered, start=1):
+            batch_updates.append({
+                "rule_id": row["rule_id"],
+                "rule_name": row["rule_name"],
+                "sequence_order": idx * 1000,
+                "visual_sequence": idx
+            })
+        return {
+            "scenario": "B_REBALANCE",
+            "mode": "batch",
+            "new_sequence_order": target * 1000,
+            "batch_updates": batch_updates
+        }
+
+    new_seq = (prev_seq + curr_seq) // 2
+    return {
+        "scenario": "B",
+        "mode": "single",
+        "new_sequence_order": new_seq,
+        "batch_updates": []
+    }
+
+def update_rule_sequence(rule_id, sequence_order):
+    """Single-record backend update handler for sequence_order."""
+    sql = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET sequence_order = {int(sequence_order)} WHERE rule_id = {int(rule_id)}"
+    return run_update(sql)
+
+def update_rule_sequence_batch(sequence_updates):
+    """Batch backend update handler for full reindex operations."""
+    ok = True
+    for row in sequence_updates:
+        ok = update_rule_sequence(row["rule_id"], row["sequence_order"]) and ok
+    return ok
+
+def run_sequence_algorithm_tests():
+    """Validation helper for the required A/B/C sequence test flow."""
+    initial = [
+        {"rule_id": 1, "rule_name": "rule1", "sequence_order": 1000},
+        {"rule_id": 2, "rule_name": "rule2", "sequence_order": 2000},
+        {"rule_id": 3, "rule_name": "rule3", "sequence_order": 3000},
+    ]
+
+    action1 = calculate_sequence_plan(initial, 2, {"rule_id": 4, "rule_name": "rule4"})
+    action1_seq = action1["new_sequence_order"]
+    after_action1 = [
+        {"rule_id": 1, "rule_name": "rule1", "sequence_order": 1000},
+        {"rule_id": 4, "rule_name": "rule4", "sequence_order": action1_seq},
+        {"rule_id": 2, "rule_name": "rule2", "sequence_order": 2000},
+        {"rule_id": 3, "rule_name": "rule3", "sequence_order": 3000},
+    ]
+    after_action1.sort(key=lambda x: x["sequence_order"])
+
+    action2 = calculate_sequence_plan(after_action1, 1, {"rule_id": 5, "rule_name": "rule5"})
+    after_action2 = action2["batch_updates"]
+
+    action1_pass = (
+        action1["scenario"] == "B"
+        and action1_seq == 1500
+        and [x["rule_name"] for x in after_action1] == ["rule1", "rule4", "rule2", "rule3"]
+    )
+    action2_pass = (
+        action2["scenario"] == "C"
+        and [x["sequence_order"] for x in after_action2] == [1000, 2000, 3000, 4000, 5000]
+        and [x["rule_name"] for x in after_action2] == ["rule5", "rule1", "rule4", "rule2", "rule3"]
+    )
+
+    return action1_pass and action2_pass
 
 def get_group_name_for_rule(rule_name):
     """Fetches the group_name for a given rule_name from the database."""
@@ -1067,12 +1249,12 @@ else:
         TABLE_SCHEMAS = {}
         
     # --- NEW: Inject saved rules (including Ephemeral) into the UI Dropdowns ---
-    saved_rules_list = get_existing_rules()
+    selected_group_id = st.session_state.get("active_group_id")
+    saved_rules_list = get_existing_rules(group_id=selected_group_id)
     if saved_rules_list:
         for r in saved_rules_list:
             rule_nm = r[1]
-            # Format the name exactly how dbt will save it in the final_rules folder
-            target_model_name = f"final_{re.sub(r'[^a-zA-Z0-9_]', '_', rule_nm.lower())}"
+            target_model_name = r[3]
             
             # If Iceberg didn't find it (because it's ephemeral), build its schema from JSON!
             if target_model_name not in TABLE_SCHEMAS:
@@ -1527,10 +1709,14 @@ else:
                         # Extract just the name for the input field
                         selected_rule_name = [r[1] for r in group_rules if r[0] == current_id][0]
                         r_name = st.text_input("Rule Name", value=selected_rule_name, disabled=True)
+
+                        # Keep sequence input aligned with the selected rule's current visual position.
+                        selected_rule_visual_seq = get_rule_visual_position(st.session_state.active_group_id, current_id)
                         
                         # Load state cleanly
                         if st.session_state.get("last_selected_rule") != selected_rule_name:
                             st.session_state.last_selected_rule = selected_rule_name
+                            st.session_state.visual_sequence_input = int(selected_rule_visual_seq)
                             if load_rule_state(selected_rule_name, st.session_state.active_group_name):
                                 st.rerun()
                     else:
@@ -1547,8 +1733,47 @@ else:
                     
                     if st.session_state.active_group_mode == 'sequential':
                         st.markdown("**Sequential Execution Setup**")
-                        loaded_seq = st.session_state.get("sequence_order", 1)
-                        sequence_order = st.number_input("Sequence Order (e.g., 1, 2, 3)", min_value=1, step=1, value=int(loaded_seq))
+
+                        default_visual = get_rule_visual_position(st.session_state.active_group_id, current_id) if action_mode == "Update Existing Rule" else (len(get_group_rules_for_sequence(st.session_state.active_group_id)) + 1)
+                        visual_sequence_input = st.session_state.get("visual_sequence_input", int(default_visual))
+
+                        seq_left, seq_right = st.columns([1, 1], gap="large")
+                        with seq_left:
+                            with st.container(border=True):
+                                sequence_visual_order = st.number_input(
+                                    "Sequence Position",
+                                    min_value=1,
+                                    step=1,
+                                    value=int(visual_sequence_input),
+                                    key="visual_sequence_input"
+                                )
+
+                        with seq_right:
+                            with st.container(border=True):
+                                rules_for_map = get_group_rules_for_sequence(
+                                    st.session_state.active_group_id
+                                )
+                                mapped_rules = map_rules_to_visual_sequence(rules_for_map)
+                                if mapped_rules:
+                                    df_seq = pd.DataFrame([
+                                        {
+                                            "Sequence Order": row["visual_sequence"],
+                                            "Rule Name": row["rule_name"]
+                                        }
+                                        for row in mapped_rules
+                                    ])
+                                    st.dataframe(df_seq, hide_index=True, use_container_width=True)
+                                else:
+                                    st.info("No existing rules in this group yet.")
+
+                        sequence_order = int(sequence_visual_order)
+
+                        # with st.expander("Sequence Logic Validation", expanded=False):
+                        #     test_ok = run_sequence_algorithm_tests()
+                        #     if test_ok:
+                        #         st.success("Sequence calculation test flow passed for Scenario B and Scenario C.")
+                        #     else:
+                        #         st.error("Sequence calculation test flow failed. Please review sequence helper logic.")
                     else:
                         st.info("ℹ️ Group is non-sequential. All rules run in parallel.")
                         sequence_order = 0
@@ -1556,9 +1781,33 @@ else:
         # ---------------------------------------------------------
         # 3 & 4. DATA SOURCES, JOINS & OUTPUT COLUMNS (50-50 Split)
         # ---------------------------------------------------------
+
+        # Restrict rule-model entries in dropdown to the currently selected group.
+        all_rules_global = get_existing_rules()
+        group_rules_only = get_existing_rules(group_id=st.session_state.active_group_id)
+
+        all_rule_models = set()
+        for _, rule_name, _, _ in all_rules_global:
+            safe_name = safe_model_name(rule_name)
+            all_rule_models.add(safe_name)
+            all_rule_models.add(f"final_{safe_name}")
+
+        group_rule_models = set()
+        for _, rule_name, _, _ in group_rules_only:
+            safe_name = safe_model_name(rule_name)
+            group_rule_models.add(safe_name)
+            group_rule_models.add(f"final_{safe_name}")
+
+        TABLE_NAMES = [
+            t for t in TABLE_SCHEMAS.keys()
+            if (t not in all_rule_models) or (t in group_rule_models)
+        ]
+
+        if st.session_state.get("t1") and st.session_state["t1"] not in TABLE_NAMES:
+            del st.session_state["t1"]
         
-        # --- NEW: Helper to visually hide 'final_' from the UI ---
-        clean_name = lambda x: x.replace("final_", "") if isinstance(x, str) and x.startswith("final_") else x
+        # Keep final_ prefix visible in the UI for approved rule-based models.
+        clean_name = lambda x: x
         
         col_src1, col_src2 = st.columns(2)
         
@@ -1986,21 +2235,68 @@ else:
                             # ALWAYS save individual draft file
                             dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
 
+                            computed_sequence_order = sequence_order
+                            sequence_plan = None
+
+                            if st.session_state.active_group_mode == 'sequential':
+                                base_rules = get_group_rules_for_sequence(
+                                    st.session_state.active_group_id,
+                                    exclude_rule_id=current_id if action_mode == "Update Existing Rule" else None
+                                )
+                                # Use temporary rule id for planning in create mode; replaced after insert.
+                                planning_rule_id = current_id if action_mode == "Update Existing Rule" else -1
+                                sequence_plan = calculate_sequence_plan(
+                                    base_rules,
+                                    sequence_order,
+                                    {"rule_id": planning_rule_id, "rule_name": r_name}
+                                )
+                                computed_sequence_order = sequence_plan["new_sequence_order"]
+
                             if action_mode == "Create New Rule":
                                 final_insert_id = get_next_rule_id() 
-                                db_query = f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id) VALUES ({final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP), {sequence_order}, {st.session_state.active_group_id})"
+                                db_query = f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id) VALUES ({final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP), {computed_sequence_order}, {st.session_state.active_group_id})"
                             else:
                                 final_insert_id = current_id
-                                db_query = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'IN_REVIEW', updated_at = CAST('{now}' AS TIMESTAMP), sequence_order = {sequence_order}, group_id = {st.session_state.active_group_id} WHERE rule_id = {final_insert_id}"
+                                db_query = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'IN_REVIEW', updated_at = CAST('{now}' AS TIMESTAMP), sequence_order = {computed_sequence_order}, group_id = {st.session_state.active_group_id} WHERE rule_id = {final_insert_id}"
                             
                             with st.spinner("Saving workflow to database..."):
                                 if run_update(db_query):
+                                    # Backend sequence handlers for A/B/C scenarios.
+                                    if st.session_state.active_group_mode == 'sequential' and sequence_plan:
+                                        if sequence_plan["mode"] == "single":
+                                            update_rule_sequence(final_insert_id, sequence_plan["new_sequence_order"])
+                                        else:
+                                            batch_payload = []
+                                            for row in sequence_plan["batch_updates"]:
+                                                row_rule_id = final_insert_id if row["rule_id"] == -1 else row["rule_id"]
+                                                batch_payload.append({
+                                                    "rule_id": row_rule_id,
+                                                    "rule_name": row["rule_name"],
+                                                    "sequence_order": row["sequence_order"],
+                                                    "visual_sequence": row["visual_sequence"]
+                                                })
+                                            update_rule_sequence_batch(batch_payload)
+
                                     manager_id = get_manager_user_id()
                                     manager_id_sql = f"'{manager_id}'" if manager_id else "NULL"
-                                    approval_id = get_next_approval_id()
-                                    run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
-                                    
-                                    st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+
+                                    if action_mode == "Create New Rule":
+                                        approval_id = get_next_approval_id()
+                                        run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
+                                        st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+                                    else:
+                                        # Reuse existing approval rows during update; do not create new entries.
+                                        has_approval_sql = f"SELECT count(*) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {final_insert_id}"
+                                        has_approval_res = run_query(has_approval_sql)
+                                        has_existing_rows = bool(has_approval_res and has_approval_res[0][0] > 0)
+
+                                        if has_existing_rows:
+                                            run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'PENDING', comments = 'Rule updated and awaiting Level 1 (Manager) review.', user_id = {manager_id_sql}, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id = 1")
+                                            run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'WAITING', comments = 'Waiting for prior level approval.', user_id = NULL, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id IN (2, 3)")
+                                            st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
+                                        else:
+                                            st.warning("Rule updated in rule_workflow, but no existing approval_workflow row was found to reuse.")
+
                                     st.info(f"📁 Draft script written to: `{dbt_filepath}`")
                                 else:
                                     st.warning(f"📁 Database operation failed.")
