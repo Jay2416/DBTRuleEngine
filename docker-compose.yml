@@ -123,7 +123,7 @@ services:
     image: dremio/dremio-oss:latest
     container_name: dremio
     environment:
-      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Dpaths.dist=file:///opt/dremio/data/dist
+      - DREMIO_JAVA_SERVER_EXTRA_OPTS=-Xms512m -Xmx1g -Dpaths.dist=file:///opt/dremio/data/dist
     volumes:
       - ./dremio_data:/opt/dremio/data
     ports:

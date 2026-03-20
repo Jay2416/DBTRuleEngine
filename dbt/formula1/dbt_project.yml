@@ -39,6 +39,8 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      driver_badges_list:
+        +schema: driver_badges_list
       all_time_wins_leaderboard:
         +schema: all_time_wins_leaderboard
       testing_group:
@@ -47,6 +49,9 @@ models:
         +schema: championship_standings_2023
     final_rules:
       +schema: final_rules
+
+      final_driver_badges_list:
+        +schema: final_driver_badges_list
 
       final_all_time_wins_leaderboard:
         +schema: final_all_time_wins_leaderboard
