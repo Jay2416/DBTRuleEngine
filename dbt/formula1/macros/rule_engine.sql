@@ -38,7 +38,13 @@ ON {{ j.left }} = {{ j.right }}
 {% if where_filters|length > 0 %}
 WHERE
 {% for w in where_filters %}
+    {% if w.op == 'IS NULL' or w.op == 'IS NOT NULL' %}
+    {{ w.col }} {{ w.op }}
+    {% elif w.op == 'BETWEEN' %}
+    {{ w.col }} BETWEEN {{ w.value }} AND {{ w.value2 }}
+    {% else %}
     {{ w.col }} {{ w.op }} {{ w.value }}
+    {% endif %}
     {% if not loop.last %} {{ w.logic }} {% endif %}
 {% endfor %}
 {% endif %}

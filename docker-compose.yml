@@ -28,19 +28,7 @@ services:
     networks:
       - iceberg_net
 
-  # -------------------- Spark Worker 2 --------------------
-  spark-worker-2:
-    build:
-      context: .
-      dockerfile: Dockerfile.spark
-    container_name: spark-worker-2
-    depends_on:
-      - spark-master
-    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
-    volumes:
-      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
-    networks:
-      - iceberg_net
+
 
   # -------------------- Spark Thrift Server --------------------
   spark-thrift:

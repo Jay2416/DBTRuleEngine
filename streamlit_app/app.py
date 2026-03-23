@@ -36,13 +36,17 @@ MINIO_ACCESS_KEY = "admin"                # <-- Update this
 MINIO_SECRET_KEY = "password123"                # <-- Update this
 MINIO_BUCKET = "formula1"
 
-@st.cache_data(ttl=300) # Caches results for 5 minutes
-def get_iceberg_schemas():
-    s3_client = boto3.client('s3',
+@st.cache_resource
+def get_s3_client():
+    return boto3.client('s3',
         endpoint_url=MINIO_ENDPOINT,
         aws_access_key_id=MINIO_ACCESS_KEY,
         aws_secret_access_key=MINIO_SECRET_KEY
     )
+
+@st.cache_data(ttl=300) # Caches results for 5 minutes
+def get_iceberg_schemas():
+    s3_client = get_s3_client()
     
     schemas = {}
     prefix = "iceberg_data/staging/"
@@ -269,6 +273,68 @@ def safe_model_name(value):
         return ""
     return re.sub(r'[^a-zA-Z0-9_]', '_', str(value).lower())
 
+def force_ephemeral_materialization(sql_text):
+    """Ensure a model SQL contains config(materialized='ephemeral')."""
+    if not isinstance(sql_text, str):
+        return sql_text
+
+    # 1) Replace explicit materialization value if present.
+    updated, replaced = re.subn(
+        r"materialized\s*=\s*['\"][^'\"]+['\"]",
+        "materialized='ephemeral'",
+        sql_text,
+        count=1,
+        flags=re.IGNORECASE
+    )
+    if replaced > 0:
+        return updated
+
+    # 2) If config exists but no materialized key, inject it.
+    updated, injected = re.subn(
+        r"\{\{\s*config\s*\(",
+        "{{ config(materialized='ephemeral', ",
+        sql_text,
+        count=1,
+        flags=re.IGNORECASE
+    )
+    if injected > 0:
+        return updated
+
+    # 3) If no config block, prepend one.
+    return "{{ config(materialized='ephemeral') }}\n\n" + sql_text
+
+def ensure_non_sequential_rules_ephemeral(group_id, group_name):
+    """Force all rule models in a non-sequential group to ephemeral materialization."""
+    rules = get_rules_by_group(group_id)
+    if not rules:
+        return False, "No rules found in group."
+
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    missing_files = []
+
+    for _, rule_name, _ in rules:
+        safe_name = safe_model_name(rule_name)
+        rule_path = os.path.join('/', 'dbt', 'formula1', 'models', 'rules', safe_group, f"{safe_name}.sql")
+
+        if not os.path.exists(rule_path):
+            missing_files.append(rule_name)
+            continue
+
+        try:
+            with open(rule_path, 'r') as f:
+                original = f.read()
+            updated = force_ephemeral_materialization(original)
+            if updated != original:
+                with open(rule_path, 'w') as f:
+                    f.write(updated)
+        except Exception as e:
+            return False, f"Failed to enforce ephemeral for '{rule_name}': {e}"
+
+    if missing_files:
+        return False, f"Missing rule SQL file(s): {', '.join(missing_files)}"
+
+    return True, "All non-sequential rules are set to ephemeral."
+
 def resolve_group_relation_name(value, relation_map):
     """Resolve a table token to either an in-group CTE name or external model name."""
     raw_name = normalize_ref_name(value)
@@ -303,6 +369,35 @@ def _clear_dynamic_widget_keys():
     keys_to_remove = [k for k in st.session_state if any(k.startswith(p) for p in prefixes)]
     for k in keys_to_remove:
         del st.session_state[k]
+
+def clear_session_for_role(role):
+    """Clear role-specific session keys not relevant to the current role."""
+    creator_keys = [
+        'joins', 'where_filters', 'order_filters', 'aggregations', 'having_filters',
+        'manual_group_by', 'row_limit', 't1', 'active_group_id', 'active_group_name',
+        'active_group_mode', 'create_new_group', 'last_selected_rule',
+        'loaded_primary_table', 'loaded_primary_columns', 'loaded_cols_joins',
+        'schema_cache_key', 'visual_sequence_input', 'sequence_order'
+    ]
+    admin_keys = ['user_editor']
+    approver_keys = ['approval_comments']
+    approver_roles = {'MANAGER', 'TECHNICAL', 'SME'}
+
+    if role != 'CREATOR':
+        for key in creator_keys:
+            if key in st.session_state:
+                del st.session_state[key]
+        _clear_dynamic_widget_keys()
+
+    if role != 'ADMIN':
+        for key in admin_keys:
+            if key in st.session_state:
+                del st.session_state[key]
+
+    if role not in approver_roles:
+        for key in approver_keys:
+            if key in st.session_state:
+                del st.session_state[key]
 
 # --- DBT & WORKFLOW HELPER FUNCTIONS ---
 def get_next_rule_id():
@@ -358,7 +453,7 @@ def save_ui_state(rule_name, group_name, state_dict):
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
     s3_key = f"ui_states/{safe_group}/{safe_name}.json"
     
-    s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+    s3_client = get_s3_client()
     try:
         json_str = json.dumps(state_dict, indent=4)
         s3_client.put_object(Bucket=MINIO_BUCKET, Key=s3_key, Body=json_str)
@@ -373,7 +468,7 @@ def load_ui_state(rule_name, group_name):
     safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', rule_name.lower())
     s3_key = f"ui_states/{safe_group}/{safe_name}.json"
     
-    s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+    s3_client = get_s3_client()
     try:
         response = s3_client.get_object(Bucket=MINIO_BUCKET, Key=s3_key)
         state = json.loads(response['Body'].read().decode('utf-8'))
@@ -565,6 +660,215 @@ def get_rules_for_approval(level_id):
     """
     return run_query(sql)
 
+def get_pending_groups_for_level(level_id):
+    """Return groups that currently have PENDING approvals at the given level."""
+    sql = f"""
+    SELECT g.group_id, g.group_name, count(*) AS pending_count
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow a
+    JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r ON a.rule_id = r.rule_id
+    JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id
+    WHERE a.level_id = {int(level_id)} AND a.action = 'PENDING'
+    GROUP BY g.group_id, g.group_name
+    ORDER BY g.group_name ASC
+    """
+    result = run_query(sql)
+    return result if result else []
+
+def get_group_rule_rows(group_id):
+    """Return all rules of a group with status."""
+    sql = f"""
+    SELECT rule_id, rule_name, status
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow
+    WHERE group_id = {int(group_id)}
+    ORDER BY rule_id ASC
+    """
+    result = run_query(sql)
+    return result if result else []
+
+def upsert_rule_approval_step(rule_id, level_id, action, comments, user_id, action_ts):
+    """Upsert one approval_workflow row for a rule+level to keep audit history consistent."""
+    existing_sql = f"""
+    SELECT approval_id
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+    WHERE rule_id = {int(rule_id)} AND level_id = {int(level_id)}
+    ORDER BY approval_id DESC
+    LIMIT 1
+    """
+    existing = run_query(existing_sql)
+
+    if existing and len(existing) > 0:
+        approval_id = existing[0][0]
+        upd_sql = f"""
+        UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+        SET action = '{action}', comments = '{comments}', user_id = '{user_id}', action_date = CAST('{action_ts}' AS TIMESTAMP)
+        WHERE approval_id = {approval_id}
+        """
+        return run_update(upd_sql)
+
+    new_id = get_next_approval_id()
+    ins_sql = f"""
+    INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
+    (approval_id, rule_id, user_id, level_id, action, comments, action_date)
+    VALUES ({new_id}, {int(rule_id)}, '{user_id}', {int(level_id)}, '{action}', '{comments}', CAST('{action_ts}' AS TIMESTAMP))
+    """
+    return run_update(ins_sql)
+
+def get_group_overview_rows():
+    """Return group-level counts for admin and manager decisioning."""
+    sql = f"""
+    SELECT
+        g.group_id,
+        g.group_name,
+        g.execution_mode,
+        count(r.rule_id) AS total_rules,
+        sum(CASE WHEN r.status = 'ACTIVE' THEN 1 ELSE 0 END) AS active_rules,
+        sum(CASE WHEN r.status = 'IN_REVIEW' THEN 1 ELSE 0 END) AS in_review_rules,
+        sum(CASE WHEN r.status = 'REJECTED' THEN 1 ELSE 0 END) AS rejected_rules
+    FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g
+    LEFT JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r ON g.group_id = r.group_id
+    GROUP BY g.group_id, g.group_name, g.execution_mode
+    ORDER BY g.group_name ASC
+    """
+    result = run_query(sql)
+    return result if result else []
+
+def approve_group_rules(group_id, approver_user_id, approver_role, comments="", force_admin=False):
+    """Approve all rules in a group at once, then execute the group's master model."""
+    if approver_role != 'MANAGER' and not force_admin:
+        return False, "Only MANAGER can bulk-approve a group from this workspace."
+
+    grp_sql = f"SELECT group_name, execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {int(group_id)} LIMIT 1"
+    grp_res = run_query(grp_sql)
+    if not grp_res:
+        return False, "Group not found."
+
+    group_name = grp_res[0][0]
+    exec_mode = grp_res[0][1]
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    rules = get_group_rule_rows(group_id)
+    if not rules:
+        return False, "Group has no rules to approve."
+
+    # Pre-validate all required SQL files before mutating DB status.
+    missing_files = []
+    for _, rule_name, _ in rules:
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(rule_name).lower())
+        draft_path = os.path.join('/', 'dbt', 'formula1', 'models', 'rules', safe_group, f"{safe_name}.sql")
+        final_path = os.path.join('/', 'dbt', 'formula1', 'models', 'final_rules', f"final_{safe_group}", f"final_{safe_name}.sql")
+        if exec_mode == 'non_sequential':
+            if not os.path.exists(draft_path):
+                missing_files.append(rule_name)
+        else:
+            if not os.path.exists(draft_path) and not os.path.exists(final_path):
+                missing_files.append(rule_name)
+
+    if missing_files:
+        return False, f"Cannot bulk-approve. Missing SQL file(s) for: {', '.join(missing_files)}"
+
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    comment_text = comments.strip() if comments and comments.strip() else f"Bulk group approval by {approver_role}."
+
+    for rule_id, rule_name, _ in rules:
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(rule_name).lower())
+        final_path = os.path.join('/', 'dbt', 'formula1', 'models', 'final_rules', f"final_{safe_group}", f"final_{safe_name}.sql")
+
+        # Sequential groups require final_<rule>.sql; non-sequential uses ephemeral draft models.
+        if exec_mode != 'non_sequential' and not os.path.exists(final_path):
+            success_copy, copy_msg = create_final_rule_file(rule_name)
+            if not success_copy:
+                return False, f"File finalization failed for '{rule_name}': {copy_msg}"
+
+        if not run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE', updated_at = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {int(rule_id)}"):
+            return False, f"Failed to mark rule ACTIVE: {rule_name}"
+
+        # Mark all workflow levels approved for this bulk action.
+        for level in (1, 2, 3):
+            if not upsert_rule_approval_step(rule_id, level, 'APPROVED', comment_text, approver_user_id, now):
+                return False, f"Failed to update approval workflow for rule: {rule_name}"
+
+    success_exec, exec_msg = execute_dbt_group(group_name)
+    if not success_exec:
+        return False, f"Rules were approved, but group execution failed: {exec_msg}"
+
+    return True, f"Approved {len(rules)} rule(s) in group '{group_name}' and executed the master group model."
+
+def delete_minio_prefix(prefix):
+    """Delete all MinIO objects under a prefix and return deleted object count."""
+    s3_client = get_s3_client()
+    deleted_count = 0
+    continuation_token = None
+
+    while True:
+        kwargs = {"Bucket": MINIO_BUCKET, "Prefix": prefix}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+
+        result = s3_client.list_objects_v2(**kwargs)
+        keys = [obj["Key"] for obj in result.get("Contents", [])]
+        for key in keys:
+            s3_client.delete_object(Bucket=MINIO_BUCKET, Key=key)
+            deleted_count += 1
+
+        if not result.get("IsTruncated"):
+            break
+        continuation_token = result.get("NextContinuationToken")
+
+    return deleted_count
+
+def delete_group_with_assets(group_id, requested_by_role):
+    """Admin-only group deletion that removes DB records, local SQL assets, and MinIO UI state."""
+    if requested_by_role != 'ADMIN':
+        return False, "Only ADMIN can delete groups."
+
+    grp_sql = f"SELECT group_name FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {int(group_id)} LIMIT 1"
+    grp_res = run_query(grp_sql)
+    if not grp_res:
+        return False, "Group not found."
+
+    group_name = grp_res[0][0]
+    safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
+    rules = get_group_rule_rows(group_id)
+
+    failed_rules = []
+    for rule_id, rule_name, _ in rules:
+        ok_approval = run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {int(rule_id)}")
+        ok_rule = run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE rule_id = {int(rule_id)}")
+        if not (ok_approval and ok_rule):
+            failed_rules.append(rule_name)
+
+    if failed_rules:
+        return False, f"Failed to delete DB rows for: {', '.join(failed_rules)}"
+
+    if not run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {int(group_id)}"):
+        return False, "Failed to delete group metadata row."
+
+    warnings = []
+    rules_dir = os.path.join('/', 'dbt', 'formula1', 'models', 'rules', safe_group)
+    final_dir = os.path.join('/', 'dbt', 'formula1', 'models', 'final_rules', f"final_{safe_group}")
+
+    try:
+        if os.path.isdir(rules_dir):
+            shutil.rmtree(rules_dir)
+    except Exception as e:
+        warnings.append(f"Could not remove rules directory: {e}")
+
+    try:
+        if os.path.isdir(final_dir):
+            shutil.rmtree(final_dir)
+    except Exception as e:
+        warnings.append(f"Could not remove final_rules directory: {e}")
+
+    try:
+        deleted_objects = delete_minio_prefix(f"ui_states/{safe_group}/")
+    except Exception as e:
+        deleted_objects = 0
+        warnings.append(f"Could not clear MinIO ui_states for group: {e}")
+
+    summary = f"Group '{group_name}' deleted. Rules removed: {len(rules)}. MinIO objects removed: {deleted_objects}."
+    if warnings:
+        summary = f"{summary} Warnings: {' | '.join(warnings)}"
+    return True, summary
+
 def read_dbt_sql(rule_name):
     """Reads the generated SQL file from the DBT folder."""
     group_name = get_group_name_for_rule(rule_name)
@@ -635,16 +939,13 @@ def process_approval(approval_id, rule_id, rule_name, level_id, user_id, action,
                 grp_res = run_query(grp_sql)
                 g_id, g_name, exec_mode = grp_res[0]
                 
-                if exec_mode == 'non_sequential':
-                    success_exec, exec_msg = execute_dbt_rule(rule_name)
-                    return (True, f"✅ Rule ACTIVE and executed! {exec_msg}") if success_exec else (False, f"⚠️ File created, but execution failed: {exec_msg}")
+                # UNIFIED EXECUTION LOGIC: Both modes wait for full group approval to run the Master file
+                if check_group_fully_approved(g_id):
+                    generate_group_sql(g_id, g_name)
+                    success_exec, exec_msg = execute_dbt_group(g_name)
+                    return (True, f"✅ Group Fully Approved! Master group compiled and executed! {exec_msg}") if success_exec else (False, f"⚠️ Master compiled, but execution failed: {exec_msg}")
                 else:
-                    if check_group_fully_approved(g_id):
-                        generate_group_sql(g_id, g_name)
-                        success_exec, exec_msg = execute_dbt_group(g_name)
-                        return (True, f"✅ Group Fully Approved! Master CTE compiled and executed! {exec_msg}") if success_exec else (False, f"⚠️ Master compiled, but execution failed: {exec_msg}")
-                    else:
-                        return True, "✅ Rule ACTIVE. Waiting for other rules in the group to be approved before executing the Master sequence."
+                    return True, "✅ Rule ACTIVE. Waiting for other rules in the group to be approved before executing the Master group file."
             else:
                 return False, f"❌ Rule ACTIVE, but file copy failed: {copy_msg}"
             
@@ -966,141 +1267,180 @@ def setup_new_group_environment(group_name):
 
 def generate_group_sql(group_id, group_name):
     """
-    Universally fetches all rules for ANY sequential group, builds the steps array, 
-    and generates a single hierarchical SQL file using the sequential macro.
+    Fetches rules for ANY group, checks the execution mode, and 
+    generates a single master SQL file using the appropriate macro.
     """
-    # 1. Fetch rules in the correct order (1000, 2000, 3000)
+    # 1. Fetch rules in the correct order
     rules = get_rules_by_group(group_id)
     if not rules:
         return False, "No rules found in group."
         
-    group_steps = []
+    # 2. Fetch group details including our new non-sequential fields
+    grp_sql = f"SELECT execution_mode, key_column, target_column FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {group_id}"
+    grp_res = run_query(grp_sql)
+    if not grp_res:
+        return False, "Group configuration not found."
 
-    # Build canonical CTE aliases and resolution map once for the entire group.
-    rule_cte_map = {r[1]: safe_model_name(r[1]) for r in rules}
-    relation_map = {}
-    for rule_name, cte_name in rule_cte_map.items():
-        safe_name = safe_model_name(rule_name)
-        relation_map[rule_name] = cte_name
-        relation_map[safe_name] = cte_name
-        relation_map[f"final_{safe_name}"] = cte_name
+    exec_mode = grp_res[0][0]
+    key_column = grp_res[0][1]
+    target_column = grp_res[0][2]
+
+    def normalize_column_token(col_name):
+        """Strip qualifiers/quotes so macro receives a raw output column name."""
+        if not isinstance(col_name, str):
+            return ""
+        token = col_name.strip().strip('`').strip('"')
+        if "." in token:
+            token = token.split(".")[-1]
+        return token
+
+    key_column = normalize_column_token(key_column)
+    target_column = normalize_column_token(target_column)
+    if not key_column or not target_column:
+        return False, "Group key/target columns are required for non-sequential execution."
     
-    # 2. Loop through rules and format the logic for the universal macro
-    for row in rules:
-        rule_id, rule_name, seq_order = row
-        state = load_ui_state(rule_name, group_name)
-        
-        if not state:
-            continue
-            
-        t1_raw = state.get("primary_table")
-        t1, is_primary_cte = resolve_group_relation_name(t1_raw, relation_map)
-        if not t1:
-            continue
-        
-        # Use resolved table token (either in-group CTE or external model).
-        from_table = t1
-
-        formatted_joins = []
-        for j in state.get("joins", []):
-            if j.get("right_table") and j.get("join_type") != "CROSS JOIN":
-                l_table = normalize_ref_name(j.get("left_table")) if j.get("left_table") else t1
-                r_table = normalize_ref_name(j.get("right_table"))
-                l_table_resolved, _ = resolve_group_relation_name(l_table, relation_map)
-                r_table_resolved, r_is_cte = resolve_group_relation_name(r_table, relation_map)
-                if not r_table_resolved:
-                    continue
-                
-                formatted_joins.append({
-                    'type': j.get("join_type"),
-                    'table': r_table_resolved,
-                    'is_cte': r_is_cte,
-                    'left': f"{l_table_resolved}.{j.get('left_col')}",
-                    'right': f"{r_table_resolved}.{j.get('right_col')}"
-                })
-
-        # Format Output Columns
-        select_cols = [f"{t1}.{c}" for c in state.get("primary_columns", [])]
-        for r_table, cols in state.get("cols_joins", {}).items():
-            resolved_r_table, _ = resolve_group_relation_name(r_table, relation_map)
-            if not resolved_r_table:
-                continue
-            select_cols.extend([f"{resolved_r_table}.{c}" for c in cols])
-
-        # Format Group By
-        macro_group_by = []
-        aggs = state.get("aggregations", [])
-        manual_gb = [rewrite_column_reference(c, relation_map) for c in state.get("manual_group_by", [])]
-        having = state.get("having_filters", [])
-        if aggs or having or manual_gb:
-            macro_group_by = list(dict.fromkeys(select_cols + manual_gb))
-
-        # Format Where Filters
-        macro_where = []
-        for f in state.get("where_filters", []):
-            if f['col']:
-                op_val = f['op'].split(" ")[0] if " " in f['op'] and "equals" in f['op'] else f['op']
-                if op_val == "equals": op_val = "="
-                val = str(f.get('val', ''))
-                if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']:
-                    val = f"'{val}'"
-                macro_where.append({
-                    'col': rewrite_column_reference(f['col'], relation_map),
-                    'op': op_val,
-                    'value': val,
-                    'logic': f.get('logic', '')
-                })
-
-        macro_having = []
-        for h in having:
-            if h.get('col') and h.get('func') and h.get('val'):
-                h_val = str(h.get('val', ''))
-                if not is_numeric_literal(h_val):
-                    h_val = f"'{h_val}'"
-                macro_having.append({
-                    'func': h['func'],
-                    'col': rewrite_column_reference(h['col'], relation_map),
-                    'op': h.get('op', '>'),
-                    'value': h_val,
-                    'logic': h.get('logic', '')
-                })
-
-        macro_order_by = []
-        for o in state.get("order_filters", []):
-            if o.get('col'):
-                macro_order_by.append({
-                    'col': rewrite_column_reference(o['col'], relation_map),
-                    'dir': o['dir']
-                })
-
-        # Build the final step dictionary for this specific rule
-        # Build the final step dictionary for this specific rule
-        step_dict = {
-            "rule_name": rule_cte_map.get(rule_name, safe_model_name(rule_name)),
-            "sequence_order": seq_order,
-            "primary_table": from_table,
-            "is_primary_cte": is_primary_cte, # Pass the flag
-            "select_columns": select_cols,
-            "aggregations": [{'func': a['func'], 'col': a['col'], 'alias': a.get('alias', '')} for a in aggs if a['col'] and a['func']],
-            "joins": formatted_joins,
-            "where_filters": macro_where,
-            "group_by": macro_group_by,
-            "having": macro_having,
-            "order_by": macro_order_by,
-            "limit_rows": state.get("row_limit") or 'None'
-        }
-        group_steps.append(step_dict)
-
-    # 3. Build the final Jinja string wrapping the universal macro
     safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     
-    generated_sql = f"""{{{{ config(materialized='table') }}}}
+    # ==========================================
+    # BRANCH A: NON-SEQUENTIAL EXECUTION
+    # ==========================================
+    if exec_mode == 'non_sequential':
+        ok_ephemeral, ep_msg = ensure_non_sequential_rules_ephemeral(group_id, group_name)
+        if not ok_ephemeral:
+            return False, ep_msg
+
+        # Reference group rule model names directly so ephemeral models compile as CTEs.
+        rule_models = [safe_model_name(r[1]) for r in rules]
+        
+        generated_sql = f"""{{{{ config(materialized='table') }}}}
+
+{{{{ non_sequential_rule_engine(
+    rule_models={rule_models},
+    key_column='{key_column}',
+    target_column='{target_column}'
+) }}}}"""
+
+    # ==========================================
+    # BRANCH B: SEQUENTIAL EXECUTION (Your existing logic)
+    # ==========================================
+    else:
+        group_steps = []
+        rule_cte_map = {r[1]: safe_model_name(r[1]) for r in rules}
+        relation_map = {}
+        for rule_name, cte_name in rule_cte_map.items():
+            safe_name = safe_model_name(rule_name)
+            relation_map[rule_name] = cte_name
+            relation_map[safe_name] = cte_name
+            relation_map[f"final_{safe_name}"] = cte_name
+        
+        for row in rules:
+            rule_id, rule_name, seq_order = row
+            state = load_ui_state(rule_name, group_name)
+            
+            if not state:
+                continue
+                
+            t1_raw = state.get("primary_table")
+            t1, is_primary_cte = resolve_group_relation_name(t1_raw, relation_map)
+            if not t1:
+                continue
+            
+            from_table = t1
+
+            formatted_joins = []
+            for j in state.get("joins", []):
+                if j.get("right_table") and j.get("join_type") != "CROSS JOIN":
+                    l_table = normalize_ref_name(j.get("left_table")) if j.get("left_table") else t1
+                    r_table = normalize_ref_name(j.get("right_table"))
+                    l_table_resolved, _ = resolve_group_relation_name(l_table, relation_map)
+                    r_table_resolved, r_is_cte = resolve_group_relation_name(r_table, relation_map)
+                    if not r_table_resolved:
+                        continue
+                    
+                    formatted_joins.append({
+                        'type': j.get("join_type"),
+                        'table': r_table_resolved,
+                        'is_cte': r_is_cte,
+                        'left': f"{l_table_resolved}.{j.get('left_col')}",
+                        'right': f"{r_table_resolved}.{j.get('right_col')}"
+                    })
+
+            select_cols = [f"{t1}.{c}" for c in state.get("primary_columns", [])]
+            for r_table, cols in state.get("cols_joins", {}).items():
+                resolved_r_table, _ = resolve_group_relation_name(r_table, relation_map)
+                if not resolved_r_table:
+                    continue
+                select_cols.extend([f"{resolved_r_table}.{c}" for c in cols])
+
+            macro_group_by = []
+            aggs = state.get("aggregations", [])
+            manual_gb = [rewrite_column_reference(c, relation_map) for c in state.get("manual_group_by", [])]
+            having = state.get("having_filters", [])
+            if aggs or having or manual_gb:
+                macro_group_by = list(dict.fromkeys(select_cols + manual_gb))
+
+            macro_where = []
+            for f in state.get("where_filters", []):
+                if f['col']:
+                    # --- NEW: Safely extract mathematical operator from parentheses ---
+                    raw_op = f.get('op', '')
+                    if '(' in raw_op and ')' in raw_op:
+                        op_val = raw_op[raw_op.find("(")+1:raw_op.find(")")]
+                    else:
+                        op_val = raw_op.split(" ")[0] if " " in raw_op and "equals" in raw_op else raw_op
+                    
+                    if op_val == "equals": op_val = "="
+                    
+                    val = str(f.get('val', ''))
+                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']:
+                        val = f"'{val}'"
+                        
+                    # --- NEW: Safely extract val2 for BETWEEN clauses ---
+                    val2 = str(f.get('val2', ''))
+                    if val2 and not is_numeric_literal(val2) and op_val not in ['IS NULL', 'IS NOT NULL']:
+                        val2 = f"'{val2}'"
+
+                    macro_where.append({
+                        'col': rewrite_column_reference(f['col'], relation_map),
+                        'op': op_val,
+                        'value': val,
+                        'value2': val2,
+                        'logic': f.get('logic', '')
+                    })
+
+            macro_order_by = []
+            for o in state.get("order_filters", []):
+                if o.get('col'):
+                    macro_order_by.append({
+                        'col': rewrite_column_reference(o['col'], relation_map),
+                        'dir': o['dir']
+                    })
+
+            step_dict = {
+                "rule_name": rule_cte_map.get(rule_name, safe_model_name(rule_name)),
+                "sequence_order": seq_order,
+                "primary_table": from_table,
+                "is_primary_cte": is_primary_cte,
+                "select_columns": select_cols,
+                "aggregations": [{'func': a['func'], 'col': a['col'], 'alias': a.get('alias', '')} for a in aggs if a['col'] and a['func']],
+                "joins": formatted_joins,
+                "where_filters": macro_where,
+                "group_by": macro_group_by,
+                "having": macro_having,
+                "order_by": macro_order_by,
+                "limit_rows": state.get("row_limit") or 'None'
+            }
+            group_steps.append(step_dict)
+
+        generated_sql = f"""{{{{ config(materialized='table') }}}}
 
 {{{{ sequential_rule_engine(
     steps={group_steps}
 ) }}}}"""
 
-    # --- FIXED: Save to the final_rules folder instead of draft ---
+    # ==========================================
+    # 3. SAVE TO FINAL_RULES FOLDER
+    # ==========================================
     dbt_dir = os.path.join("/", "dbt", "formula1", "models", "final_rules", f"final_{safe_group}")
     os.makedirs(dbt_dir, exist_ok=True)
     
@@ -1120,15 +1460,25 @@ def execute_dbt_group(group_name):
     """Executes the unified group SQL file."""
     safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     dbt_target = f"final_{safe_group}"
+
+    grp_sql = f"SELECT group_id FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_name = '{group_name}' LIMIT 1"
+    grp_res = run_query(grp_sql)
+    if not grp_res:
+        return False, f"Group not found: {group_name}"
+
+    group_id = grp_res[0][0]
+    generated_ok, generated_msg = generate_group_sql(group_id, group_name)
+    if not generated_ok:
+        return False, f"Failed to generate master group SQL: {generated_msg}"
     
     command = f'docker exec dbt bash -c "cd formula1 && dbt run --select {dbt_target}"'
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
         if result.returncode == 0:
-            return True, f"✅ Group Executed Successfully!\n\nLogs:\n{result.stdout}"
+            return True, f"✅ Group SQL generated at {generated_msg} and executed successfully!\n\nLogs:\n{result.stdout}"
         else:
             error_output = result.stderr if result.stderr else result.stdout
-            return False, f"Group execution failed. Logs:\n{error_output}"
+            return False, f"Group SQL generated at {generated_msg}, but execution failed. Logs:\n{error_output}"
     except Exception as e:
         return False, f"System error calling Docker: {e}"
 
@@ -1237,66 +1587,6 @@ if not st.session_state.logged_in:
 # --- LOGGED IN DASHBOARD (NEW UI) ---
 else:
     user = st.session_state.user_info
-    
-    # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
-    # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
-    try:
-        TABLE_SCHEMAS = get_iceberg_schemas()
-        if not TABLE_SCHEMAS:
-            st.warning("No schemas found in MinIO. Please check your connection and paths.")
-    except Exception as e:
-        st.error(f"Failed to fetch schemas from MinIO: {e}")
-        TABLE_SCHEMAS = {}
-        
-    # --- NEW: Inject saved rules (including Ephemeral) into the UI Dropdowns ---
-    selected_group_id = st.session_state.get("active_group_id")
-    saved_rules_list = get_existing_rules(group_id=selected_group_id)
-    if saved_rules_list:
-        for r in saved_rules_list:
-            rule_nm = r[1]
-            target_model_name = r[3]
-            
-            # If Iceberg didn't find it (because it's ephemeral), build its schema from JSON!
-            if target_model_name not in TABLE_SCHEMAS:
-                
-                # --- FIXED: Fetch the group name dynamically before loading UI state ---
-                rule_group_name = get_group_name_for_rule(rule_nm)
-                state = load_ui_state(rule_nm, rule_group_name)
-                # ---------------------------------------------------------------------
-                
-                if state:
-                    # Reconstruct the expected output columns
-                    simulated_cols = state.get("primary_columns", [])
-                    for j_cols in state.get("cols_joins", {}).values():
-                        simulated_cols.extend(j_cols)
-                    for agg in state.get("aggregations", []):
-                        if agg.get("alias"):
-                            simulated_cols.append(agg["alias"])
-                    
-                    if simulated_cols:
-                        # Add it to our schemas dictionary so Streamlit can use it!
-                        TABLE_SCHEMAS[target_model_name] = list(set(simulated_cols))
-
-    TABLE_NAMES = list(TABLE_SCHEMAS.keys())
-    if not TABLE_NAMES:
-        st.error("No tables available to build query.")
-        st.stop()
-
-    # Initialize dynamic session states for UI forms
-    if 'joins' not in st.session_state:
-        st.session_state.joins = []
-    if 'where_filters' not in st.session_state:
-        st.session_state.where_filters = [{"id": str(uuid.uuid4()), "col": "", "op": "equals (=)", "val": "", "logic": "AND"}]
-    if 'order_filters' not in st.session_state:
-        st.session_state.order_filters = [{"id": str(uuid.uuid4()), "col": "", "dir": "ASC"}]
-    if 'aggregations' not in st.session_state:
-        st.session_state.aggregations = []
-    if 'having_filters' not in st.session_state:
-        st.session_state.having_filters = []
-    if 'manual_group_by' not in st.session_state:
-        st.session_state.manual_group_by = []
-    if 'row_limit' not in st.session_state:
-        st.session_state.row_limit = None
 
     # --- SIDEBAR NAV ---
     with st.sidebar:
@@ -1312,11 +1602,91 @@ else:
         st.header(f"👤 {user['firstname']} {user['lastname']}")
         st.caption(f"Role: {user['role']}")
         if st.button("🚪 Logout", use_container_width=True):
+            keys_to_keep = {'logged_in', 'user_info'}
+            for key in list(st.session_state.keys()):
+                if key not in keys_to_keep:
+                    del st.session_state[key]
             st.session_state.logged_in = False
             st.session_state.user_info = None
             st.rerun()
 
     role = user["role"]
+
+    previous_role = st.session_state.get('_last_active_role')
+    if previous_role != role:
+        clear_session_for_role(role)
+        st.session_state._last_active_role = role
+
+    if role == 'CREATOR':
+        # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
+        # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
+        try:
+            TABLE_SCHEMAS = get_iceberg_schemas()
+            if not TABLE_SCHEMAS:
+                st.warning("No schemas found in MinIO. Please check your connection and paths.")
+        except Exception as e:
+            st.error(f"Failed to fetch schemas from MinIO: {e}")
+            TABLE_SCHEMAS = {}
+            
+        # --- NEW: Inject saved rules (including Ephemeral) into the UI Dropdowns ---
+        selected_group_id = st.session_state.get("active_group_id")
+
+        @st.cache_data
+        def get_simulated_schemas(group_id, cache_bust_key):
+            rules = get_existing_rules(group_id=group_id)
+            extra_schemas = {}
+            for r in rules:
+                rule_nm = r[1]
+                target_model_name = r[3]
+                rule_group_name = get_group_name_for_rule(rule_nm)
+                state = load_ui_state(rule_nm, rule_group_name)
+                if state:
+                    simulated_cols = state.get("primary_columns", [])
+                    for j_cols in state.get("cols_joins", {}).values():
+                        simulated_cols.extend(j_cols)
+                    for agg in state.get("aggregations", []):
+                        if agg.get("alias"):
+                            simulated_cols.append(agg["alias"])
+                    if simulated_cols:
+                        extra_schemas[target_model_name] = list(set(simulated_cols))
+            return extra_schemas
+
+        simulated = get_simulated_schemas(
+            selected_group_id,
+            st.session_state.get("schema_cache_key", 0)
+        )
+        for model_name, cols in simulated.items():
+            if model_name not in TABLE_SCHEMAS:
+                TABLE_SCHEMAS[model_name] = cols
+
+        TABLE_NAMES = list(TABLE_SCHEMAS.keys())
+        if not TABLE_NAMES:
+            st.error("No tables available to build query.")
+            st.stop()
+
+        # Initialize dynamic session states for UI forms
+        if 'schema_cache_key' not in st.session_state:
+            st.session_state.schema_cache_key = 0
+        if 'joins' not in st.session_state:
+            st.session_state.joins = []
+        if 'where_filters' not in st.session_state:
+            st.session_state.where_filters = [{"id": str(uuid.uuid4()), "col": "", "op": "equals (=)", "val": "", "logic": "AND"}]
+        if 'order_filters' not in st.session_state:
+            st.session_state.order_filters = [{"id": str(uuid.uuid4()), "col": "", "dir": "ASC"}]
+        if 'aggregations' not in st.session_state:
+            st.session_state.aggregations = []
+        if 'having_filters' not in st.session_state:
+            st.session_state.having_filters = []
+        if 'manual_group_by' not in st.session_state:
+            st.session_state.manual_group_by = []
+        if 'row_limit' not in st.session_state:
+            st.session_state.row_limit = None
+    elif role == 'ADMIN':
+        TABLE_SCHEMAS = {}
+        TABLE_NAMES = []
+    elif role in ['MANAGER', 'TECHNICAL', 'SME']:
+        TABLE_SCHEMAS = {}
+        TABLE_NAMES = []
 
     if role == "ADMIN":
         st.title("🛡️ Admin Control Panel")
@@ -1464,6 +1834,7 @@ else:
                 with col1:
                     if st.button("✅ Force Approve", use_container_width=True):
                         if run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE' WHERE rule_id = {sel_rule_id}"):
+                            action_success = False
                             
                             # --- NEW: Add the Level 3 Approval Record so UI updates! ---
                             now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1489,23 +1860,22 @@ else:
                                     grp_res = run_query(grp_sql)
                                     g_id, g_name, exec_mode = grp_res[0]
 
-                                    if exec_mode == 'non_sequential':
-                                        success_exec, exec_msg = execute_dbt_rule(sel_rule_name)
-                                        if success_exec: st.success(f"✅ Rule forced to ACTIVE and executed!")
-                                        else: st.error(f"⚠️ DBT execution failed:\n{exec_msg}")
-                                    else:
-                                        if check_group_fully_approved(g_id):
-                                            generate_group_sql(g_id, g_name)
-                                            success_exec, exec_msg = execute_dbt_group(g_name)
-                                            if success_exec: st.success("✅ Sequence Complete! Master group file generated and executed.")
-                                            else: st.error(f"⚠️ Group compiled but failed to run:\n{exec_msg}")
+                                    if check_group_fully_approved(g_id):
+                                        success_exec, exec_msg = execute_dbt_group(g_name)
+                                        if success_exec:
+                                            st.success("✅ Group fully approved. Master group file generated and executed.")
+                                            action_success = True
                                         else:
-                                            st.success("✅ Rule forced to ACTIVE. Execution paused until all rules in group are approved.")
+                                            st.error(f"⚠️ Group generation/execution failed:\n{exec_msg}")
+                                    else:
+                                        st.success("✅ Rule forced to ACTIVE. Execution paused until all rules in group are approved.")
+                                        action_success = True
                                 else:
                                     st.error(f"❌ Forced to ACTIVE, but file issue: {copy_msg}")
-                                
-                            time.sleep(3.5)
-                            st.rerun()
+
+                            if action_success:
+                                time.sleep(2)
+                                st.rerun()
                             
                 with col2:
                     if st.button("❌ Force Reject", use_container_width=True):
@@ -1516,17 +1886,17 @@ else:
                             
                 with col3:
                     if st.button("🗑️ Delete Rule", type="primary", use_container_width=True):
+                        group_name = get_group_name_for_rule(sel_rule_name)
+                        safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower()) if group_name else "ungrouped"
+                        safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', sel_rule_name.lower())
+
                         # 1. Delete associated approval records first (Foreign Key constraint logic)
                         run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {sel_rule_id}")
                         
                         # 2. Delete the rule from the main table
                         if run_update(f"DELETE FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow WHERE rule_id = {sel_rule_id}"):
-                            
+
                             # 3. Physically delete the generated files
-                            group_name = get_group_name_for_rule(sel_rule_name)
-                            safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
-                            safe_name = re.sub(r'[^a-zA-Z0-9_]', '_', sel_rule_name.lower())
-                            
                             # A. Delete Draft SQL file from /rules folder
                             sql_path = os.path.join("/", "dbt", "formula1", "models", "rules", safe_group, f"{safe_name}.sql")
                             if os.path.exists(sql_path): 
@@ -1539,7 +1909,7 @@ else:
                                 
                             # C. Delete JSON State from MinIO
                             try:
-                                s3_client = boto3.client('s3', endpoint_url=MINIO_ENDPOINT, aws_access_key_id=MINIO_ACCESS_KEY, aws_secret_access_key=MINIO_SECRET_KEY)
+                                s3_client = get_s3_client()
                                 s3_client.delete_object(Bucket=MINIO_BUCKET, Key=f"ui_states/{safe_group}/{safe_name}.json")
                             except Exception as e:
                                 st.warning(f"Note: Could not delete UI state from MinIO: {e}")
@@ -1549,6 +1919,75 @@ else:
                             st.rerun()
             else:
                 st.info("No rules currently exist in the database.")
+
+            st.divider()
+            st.markdown("### ⚡ Group-Level God-Mode Actions")
+            st.caption("Bulk-approve an entire group or permanently delete a group and all linked assets.")
+
+            group_rows = get_group_overview_rows()
+            if group_rows:
+                group_df = pd.DataFrame(
+                    group_rows,
+                    columns=["Group ID", "Group Name", "Mode", "Total Rules", "Active", "In Review", "Rejected"]
+                )
+                st.dataframe(group_df, use_container_width=True, hide_index=True)
+
+                group_dict = {
+                    f"Group ID: {row[0]} | {row[1]} ({row[2]}) | Rules: {row[3]}": row
+                    for row in group_rows
+                }
+                selected_group_label = st.selectbox(
+                    "Select Group to Modify:",
+                    list(group_dict.keys()),
+                    key="god_mode_group_selector"
+                )
+                selected_group_row = group_dict[selected_group_label]
+                selected_group_id = selected_group_row[0]
+                selected_group_name = selected_group_row[1]
+
+                group_comments = st.text_area(
+                    "Group action comments (optional):",
+                    key="god_mode_group_comments",
+                    placeholder="Reason for force-approving or deleting this group..."
+                )
+
+                g_col1, g_col2 = st.columns(2)
+                with g_col1:
+                    if st.button("✅ Force Approve Whole Group", use_container_width=True, key="god_force_approve_group"):
+                        with st.spinner("Approving all rules in group and running master model..."):
+                            success, msg = approve_group_rules(
+                                selected_group_id,
+                                user['user_id'],
+                                user['role'],
+                                comments=group_comments,
+                                force_admin=True
+                            )
+                            if success:
+                                st.success(msg)
+                                time.sleep(1.5)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+                with g_col2:
+                    confirm_delete_group = st.checkbox(
+                        f"I understand this permanently deletes group '{selected_group_name}' and all associated rules/assets.",
+                        key="confirm_group_delete"
+                    )
+                    if st.button("🗑️ Delete Group (Admin Only)", type="primary", use_container_width=True, key="god_delete_group"):
+                        if not confirm_delete_group:
+                            st.error("Please confirm group deletion first.")
+                        else:
+                            with st.spinner("Deleting group, related rules, SQL assets, and MinIO states..."):
+                                success, msg = delete_group_with_assets(selected_group_id, user['role'])
+                                if success:
+                                    st.success(msg)
+                                    time.sleep(1.5)
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+            else:
+                st.info("No groups currently exist in the database.")
     
     elif role in ["MANAGER", "TECHNICAL", "SME"]:
         st.title(f"✅ {role.capitalize()} Approval Workspace")
@@ -1556,6 +1995,51 @@ else:
         # Map role to numeric level
         level_map = {"MANAGER": 1, "TECHNICAL": 2, "SME": 3}
         my_level = level_map[role]
+
+        if role == "MANAGER":
+            st.markdown("### Group Approval")
+            st.caption("Approve all rules in a group at once and trigger group execution.")
+
+            pending_groups = get_pending_groups_for_level(my_level)
+            if pending_groups:
+                pending_group_dict = {
+                    f"Group ID: {g[0]} | {g[1]} | Pending at L{my_level}: {g[2]}": g
+                    for g in pending_groups
+                }
+                selected_group_label = st.selectbox(
+                    "Select Group to Approve in Bulk:",
+                    list(pending_group_dict.keys()),
+                    key="manager_group_approval_selector"
+                )
+                selected_group = pending_group_dict[selected_group_label]
+                selected_group_id = selected_group[0]
+
+                manager_group_comments = st.text_area(
+                    "Group Approval Comments (optional):",
+                    key="manager_group_approval_comments",
+                    placeholder="Optional audit note for bulk approval"
+                )
+
+                if st.button("Approve Whole Group", type="primary", key="manager_bulk_approve_btn"):
+                    with st.spinner("Approving all rules in this group and running master model..."):
+                        success, msg = approve_group_rules(
+                            selected_group_id,
+                            user['user_id'],
+                            role,
+                            comments=manager_group_comments,
+                            force_admin=False
+                        )
+                        if success:
+                            st.success(msg)
+                            time.sleep(1.5)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+            else:
+                st.info("No groups are pending at Manager level for bulk approval.")
+
+            st.divider()
+            st.markdown("### Rule-by-Rule Approval")
         
         pending_rules = get_rules_for_approval(my_level)
         
@@ -1603,6 +2087,8 @@ else:
     elif role == "CREATOR":
         # --- MAIN QUERY BUILDER AREA ---
         st.title("Rule Registry: Manage Business Logic")
+
+        clean_name = lambda x: str(x) if x else ""
         
         # Initialize session state for UI toggles
         if "create_new_group" not in st.session_state:
@@ -1639,6 +2125,26 @@ else:
                     st.info("🆕 Creating a New Rule Group")
                     new_g_name = st.text_input("New Group Name:", placeholder="e.g., Fraud_Risk_Scoring")
                     new_g_mode = st.radio("Execution Mode:", ["non_sequential", "sequential"], horizontal=True)
+                    
+                    # --- NEW UI FOR NON-SEQUENTIAL FIELDS ---
+                    source_tbl = ""
+                    key_col = ""
+                    target_col = ""
+                    
+                    if new_g_mode == 'non_sequential':
+                        with st.container(border=True):
+                            st.markdown("##### ⚙️ Non-Sequential Configuration")
+                            st.caption("Define the base table and how parallel rules should be aggregated.")
+                            
+                            # 1. Select the base table
+                            source_tbl = st.selectbox("Base Source Table:", TABLE_NAMES, key="new_grp_src", format_func=clean_name)
+                            
+                            # 2. Dynamically load columns for the selected table to pick the Primary Key
+                            avail_cols = TABLE_SCHEMAS.get(source_tbl, []) if source_tbl else []
+                            key_col = st.selectbox("Grouping Key (e.g., id):", avail_cols, key="new_grp_key", help="The primary key used to GROUP BY and stack the rules.")
+                            
+                            # 3. Name the output column for the LISTAGG function
+                            target_col = st.text_input("Target Column to ListAgg:", placeholder="e.g., triggered_rules", key="new_grp_tgt", help="The name of the new column that will hold the comma-separated values.")
             
             with col2:
                 st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
@@ -1649,32 +2155,41 @@ else:
                 else:
                     if st.button("💾 Save Group", type="primary", use_container_width=True):
                         if new_g_name:
-                            new_id = get_next_group_id()
-                            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            
-                            # Grab the username from the active session
-                            current_user = user['username']
-                            
-                            # UPDATED SQL: Removed 'status', added 'created_by' to match your schema
-                            sql = f"""
-                            INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group 
-                            (group_id, group_name, execution_mode, created_by, created_at) 
-                            VALUES 
-                            ({new_id}, '{new_g_name}', '{new_g_mode}', '{current_user}', CAST('{now}' AS TIMESTAMP))
-                            """
-                            
-                            if run_update(sql):
-                                # Setup the DBT environment
-                                success, msg = setup_new_group_environment(new_g_name)
+                            # --- 1. Validation for Non-Sequential Requirements ---
+                            if new_g_mode == 'non_sequential' and not (source_tbl and key_col and target_col):
+                                st.error("⚠️ Please fill in the Source Table, Grouping Key, and Target Column for non-sequential execution.")
+                            else:
+                                new_id = get_next_group_id()
+                                now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                current_user = user['username']
                                 
-                                if success:
-                                    st.success(f"Group created! {msg}")
-                                else:
-                                    st.warning(f"Group saved to DB, but env setup failed: {msg}")
+                                # --- 2. Safe SQL Formatting ---
+                                # If the mode is sequential, these fields will be empty strings. 
+                                # We must format them as NULL to prevent Hive syntax errors.
+                                st_val = f"'{source_tbl}'" if source_tbl else "NULL"
+                                kc_val = f"'{key_col}'" if key_col else "NULL"
+                                tc_val = f"'{target_col}'" if target_col else "NULL"
                                 
-                                st.session_state.create_new_group = False
-                                time.sleep(1.5)
-                                st.rerun()
+                                # --- 3. Updated Insert Query ---
+                                sql = f"""
+                                INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group 
+                                (group_id, group_name, execution_mode, created_by, created_at, source_table, key_column, target_column) 
+                                VALUES 
+                                ({new_id}, '{new_g_name}', '{new_g_mode}', '{current_user}', CAST('{now}' AS TIMESTAMP), {st_val}, {kc_val}, {tc_val})
+                                """
+                                
+                                if run_update(sql):
+                                    # Setup the DBT environment
+                                    success, msg = setup_new_group_environment(new_g_name)
+                                    
+                                    if success:
+                                        st.success(f"Group created! {msg}")
+                                    else:
+                                        st.warning(f"Group saved to DB, but env setup failed: {msg}")
+                                    
+                                    st.session_state.create_new_group = False
+                                    time.sleep(1.5)
+                                    st.rerun()
                         else:
                             st.error("Group Name required.")
 
@@ -2155,7 +2670,6 @@ else:
             st.number_input("Maximum rows to return (leave blank or 0 for no limit)", value=None, min_value=1, step=1, key="row_limit", placeholder="e.g., 100")
 
         # 4. Preview & Run
-        # 4. Preview & Run
         with st.container(border=True):
             st.markdown("#### 4. Preview & Run")
 
@@ -2185,11 +2699,25 @@ else:
             macro_where = []
             for f in st.session_state.where_filters:
                 if f['col']:
-                    op_val = f['op'].split(" ")[0] if " " in f['op'] and "equals" in f['op'] else f['op']
+                    # --- NEW: Safely extract mathematical operator from parentheses ---
+                    raw_op = f.get('op', '')
+                    if '(' in raw_op and ')' in raw_op:
+                        op_val = raw_op[raw_op.find("(")+1:raw_op.find(")")]
+                    else:
+                        op_val = raw_op.split(" ")[0] if " " in raw_op and "equals" in raw_op else raw_op
+                        
                     if op_val == "equals": op_val = "="
+                    
                     val = str(f.get('val', ''))
-                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']: val = f"'{val}'"
-                    macro_where.append({'col': f['col'], 'op': op_val, 'value': val, 'logic': f.get('logic', '')})
+                    if val and not is_numeric_literal(val) and op_val not in ['IS NULL', 'IS NOT NULL']: 
+                        val = f"'{val}'"
+                        
+                    # --- NEW: Safely extract val2 for BETWEEN clauses ---
+                    val2 = str(f.get('val2', ''))
+                    if val2 and not is_numeric_literal(val2) and op_val not in ['IS NULL', 'IS NOT NULL']: 
+                        val2 = f"'{val2}'"
+                        
+                    macro_where.append({'col': f['col'], 'op': op_val, 'value': val, 'value2': val2, 'logic': f.get('logic', '')})
 
             macro_having = []
             for h in st.session_state.having_filters:
@@ -2201,7 +2729,9 @@ else:
             macro_order = [{'col': o['col'], 'dir': o['dir']} for o in st.session_state.order_filters if o.get('col')]
             macro_limit = st.session_state.get("row_limit") or 'None'
 
-            generated_sql = f"""{{{{ config(materialized='table') }}}}
+            rule_materialization = 'ephemeral' if st.session_state.active_group_mode == 'non_sequential' else 'table'
+
+            generated_sql = f"""{{{{ config(materialized='{rule_materialization}') }}}}
 
 {{{{ rule_engine(
     tables={macro_tables}, joins={macro_joins}, select_columns={macro_select_cols},
@@ -2219,89 +2749,120 @@ else:
                     if not r_name:
                         st.error("Please enter a Rule Name before running.")
                     else:
-                        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        current_user = user['username']
-                        try:
-                            ui_state = {
-                                "primary_table": t1, "primary_columns": cols_t1, "joins": st.session_state.joins,
-                                "cols_joins": cols_joins, "aggregations": st.session_state.aggregations,
-                                "having_filters": st.session_state.having_filters, "manual_group_by": st.session_state.manual_group_by,
-                                "row_limit": st.session_state.row_limit, "where_filters": st.session_state.where_filters,
-                                "order_filters": st.session_state.order_filters, "sequence_order": sequence_order
-                            }
+                        # --- NEW: SCHEMA ENFORCEMENT FOR NON-SEQUENTIAL GROUPS ---
+                        passed_schema_check = True
+                        
+                        if st.session_state.active_group_mode == 'non_sequential':
+                            # 1. Fetch the required columns for this group
+                            grp_sql = f"SELECT key_column, target_column FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {st.session_state.active_group_id}"
+                            grp_res = run_query(grp_sql)
+                            req_key = grp_res[0][0]
+                            req_tgt = grp_res[0][1]
                             
-                            save_ui_state(r_name, st.session_state.active_group_name, ui_state)
+                            # 2. Extract the final column names the user has built in the UI
+                            # Strip the 'table.' prefix from selected columns
+                            final_output_cols = [c.split('.')[-1] for c in macro_select_cols]
+                            # Add any aliases created in aggregations
+                            final_output_cols.extend([a['alias'] for a in macro_aggs if a.get('alias')])
                             
-                            # ALWAYS save individual draft file
-                            dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
+                            # 3. Validate
+                            missing_cols = []
+                            if req_key not in final_output_cols:
+                                missing_cols.append(f"`{req_key}` (Grouping Key)")
+                            if req_tgt not in final_output_cols:
+                                missing_cols.append(f"`{req_tgt}` (Target Column)")
+                                
+                            if missing_cols:
+                                passed_schema_check = False
+                                st.error(f"❌ **Schema Mismatch:** This rule belongs to a non-sequential group. Your final output MUST contain: {', '.join(missing_cols)}.")
+                                st.info("💡 *Tip: Ensure you selected these columns in Step 4, or use an Aggregation Alias to rename a calculated field to match the Target Column.*")
+                        
+                        # --- PROCEED ONLY IF SCHEMA CHECK PASSES ---
+                        if passed_schema_check:
+                            now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            current_user = user['username']
+                            try:
+                                ui_state = {
+                                    "primary_table": t1, "primary_columns": cols_t1, "joins": st.session_state.joins,
+                                    "cols_joins": cols_joins, "aggregations": st.session_state.aggregations,
+                                    "having_filters": st.session_state.having_filters, "manual_group_by": st.session_state.manual_group_by,
+                                    "row_limit": st.session_state.row_limit, "where_filters": st.session_state.where_filters,
+                                    "order_filters": st.session_state.order_filters, "sequence_order": sequence_order
+                                }
+                                
+                                save_ui_state(r_name, st.session_state.active_group_name, ui_state)
+                                st.session_state.schema_cache_key = st.session_state.get("schema_cache_key", 0) + 1
+                                
+                                # ALWAYS save individual draft file
+                                dbt_filepath = save_dbt_model(r_name, st.session_state.active_group_name, generated_sql)
 
-                            computed_sequence_order = sequence_order
-                            sequence_plan = None
+                                computed_sequence_order = sequence_order
+                                sequence_plan = None
 
-                            if st.session_state.active_group_mode == 'sequential':
-                                base_rules = get_group_rules_for_sequence(
-                                    st.session_state.active_group_id,
-                                    exclude_rule_id=current_id if action_mode == "Update Existing Rule" else None
-                                )
-                                # Use temporary rule id for planning in create mode; replaced after insert.
-                                planning_rule_id = current_id if action_mode == "Update Existing Rule" else -1
-                                sequence_plan = calculate_sequence_plan(
-                                    base_rules,
-                                    sequence_order,
-                                    {"rule_id": planning_rule_id, "rule_name": r_name}
-                                )
-                                computed_sequence_order = sequence_plan["new_sequence_order"]
+                                if st.session_state.active_group_mode == 'sequential':
+                                    base_rules = get_group_rules_for_sequence(
+                                        st.session_state.active_group_id,
+                                        exclude_rule_id=current_id if action_mode == "Update Existing Rule" else None
+                                    )
+                                    # Use temporary rule id for planning in create mode; replaced after insert.
+                                    planning_rule_id = current_id if action_mode == "Update Existing Rule" else -1
+                                    sequence_plan = calculate_sequence_plan(
+                                        base_rules,
+                                        sequence_order,
+                                        {"rule_id": planning_rule_id, "rule_name": r_name}
+                                    )
+                                    computed_sequence_order = sequence_plan["new_sequence_order"]
 
-                            if action_mode == "Create New Rule":
-                                final_insert_id = get_next_rule_id() 
-                                db_query = f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id) VALUES ({final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP), {computed_sequence_order}, {st.session_state.active_group_id})"
-                            else:
-                                final_insert_id = current_id
-                                db_query = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'IN_REVIEW', updated_at = CAST('{now}' AS TIMESTAMP), sequence_order = {computed_sequence_order}, group_id = {st.session_state.active_group_id} WHERE rule_id = {final_insert_id}"
-                            
-                            with st.spinner("Saving workflow to database..."):
-                                if run_update(db_query):
-                                    # Backend sequence handlers for A/B/C scenarios.
-                                    if st.session_state.active_group_mode == 'sequential' and sequence_plan:
-                                        if sequence_plan["mode"] == "single":
-                                            update_rule_sequence(final_insert_id, sequence_plan["new_sequence_order"])
-                                        else:
-                                            batch_payload = []
-                                            for row in sequence_plan["batch_updates"]:
-                                                row_rule_id = final_insert_id if row["rule_id"] == -1 else row["rule_id"]
-                                                batch_payload.append({
-                                                    "rule_id": row_rule_id,
-                                                    "rule_name": row["rule_name"],
-                                                    "sequence_order": row["sequence_order"],
-                                                    "visual_sequence": row["visual_sequence"]
-                                                })
-                                            update_rule_sequence_batch(batch_payload)
-
-                                    manager_id = get_manager_user_id()
-                                    manager_id_sql = f"'{manager_id}'" if manager_id else "NULL"
-
-                                    if action_mode == "Create New Rule":
-                                        approval_id = get_next_approval_id()
-                                        run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
-                                        st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
-                                    else:
-                                        # Reuse existing approval rows during update; do not create new entries.
-                                        has_approval_sql = f"SELECT count(*) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {final_insert_id}"
-                                        has_approval_res = run_query(has_approval_sql)
-                                        has_existing_rows = bool(has_approval_res and has_approval_res[0][0] > 0)
-
-                                        if has_existing_rows:
-                                            run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'PENDING', comments = 'Rule updated and awaiting Level 1 (Manager) review.', user_id = {manager_id_sql}, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id = 1")
-                                            run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'WAITING', comments = 'Waiting for prior level approval.', user_id = NULL, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id IN (2, 3)")
-                                            st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
-                                        else:
-                                            st.warning("Rule updated in rule_workflow, but no existing approval_workflow row was found to reuse.")
-
-                                    st.info(f"📁 Draft script written to: `{dbt_filepath}`")
+                                if action_mode == "Create New Rule":
+                                    final_insert_id = get_next_rule_id() 
+                                    db_query = f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow (rule_id, rule_name, status, created_by, created_at, updated_at, sequence_order, group_id) VALUES ({final_insert_id}, '{r_name}', 'IN_REVIEW', '{current_user}', CAST('{now}' AS TIMESTAMP), CAST('{now}' AS TIMESTAMP), {computed_sequence_order}, {st.session_state.active_group_id})"
                                 else:
-                                    st.warning(f"📁 Database operation failed.")
-                        except Exception as e:
-                            st.error(f"❌ Failed to process rule: {e}")
+                                    final_insert_id = current_id
+                                    db_query = f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'IN_REVIEW', updated_at = CAST('{now}' AS TIMESTAMP), sequence_order = {computed_sequence_order}, group_id = {st.session_state.active_group_id} WHERE rule_id = {final_insert_id}"
+                                
+                                with st.spinner("Saving workflow to database..."):
+                                    if run_update(db_query):
+                                        # Backend sequence handlers for A/B/C scenarios.
+                                        if st.session_state.active_group_mode == 'sequential' and sequence_plan:
+                                            if sequence_plan["mode"] == "single":
+                                                update_rule_sequence(final_insert_id, sequence_plan["new_sequence_order"])
+                                            else:
+                                                batch_payload = []
+                                                for row in sequence_plan["batch_updates"]:
+                                                    row_rule_id = final_insert_id if row["rule_id"] == -1 else row["rule_id"]
+                                                    batch_payload.append({
+                                                        "rule_id": row_rule_id,
+                                                        "rule_name": row["rule_name"],
+                                                        "sequence_order": row["sequence_order"],
+                                                        "visual_sequence": row["visual_sequence"]
+                                                    })
+                                                update_rule_sequence_batch(batch_payload)
+
+                                        manager_id = get_manager_user_id()
+                                        manager_id_sql = f"'{manager_id}'" if manager_id else "NULL"
+
+                                        if action_mode == "Create New Rule":
+                                            approval_id = get_next_approval_id()
+                                            run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
+                                            st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+                                        else:
+                                            # Reuse existing approval rows during update; do not create new entries.
+                                            has_approval_sql = f"SELECT count(*) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {final_insert_id}"
+                                            has_approval_res = run_query(has_approval_sql)
+                                            has_existing_rows = bool(has_approval_res and has_approval_res[0][0] > 0)
+
+                                            if has_existing_rows:
+                                                run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'PENDING', comments = 'Rule updated and awaiting Level 1 (Manager) review.', user_id = {manager_id_sql}, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id = 1")
+                                                run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'WAITING', comments = 'Waiting for prior level approval.', user_id = NULL, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id IN (2, 3)")
+                                                st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
+                                            else:
+                                                st.warning("Rule updated in rule_workflow, but no existing approval_workflow row was found to reuse.")
+
+                                        st.info(f"📁 Draft script written to: `{dbt_filepath}`")
+                                    else:
+                                        st.warning(f"📁 Database operation failed.")
+                            except Exception as e:
+                                st.error(f"❌ Failed to process rule: {e}")
                             
             with col_btn2:
                 if st.button("Clear All"):

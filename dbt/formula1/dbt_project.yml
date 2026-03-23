@@ -39,6 +39,16 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      front_grid_starters:
+        +schema: front_grid_starters
+      driver_podium_history:
+        +schema: driver_podium_history
+      yearly_race_calendar:
+        +schema: yearly_race_calendar
+      nationality_driver_aggregation:
+        +schema: nationality_driver_aggregation
+      driver_flags_ns:
+        +schema: driver_flags_ns
       driver_badges_list:
         +schema: driver_badges_list
       all_time_wins_leaderboard:
@@ -49,6 +59,21 @@ models:
         +schema: championship_standings_2023
     final_rules:
       +schema: final_rules
+
+      final_front_grid_starters:
+        +schema: final_front_grid_starters
+
+      final_driver_podium_history:
+        +schema: final_driver_podium_history
+
+      final_yearly_race_calendar:
+        +schema: final_yearly_race_calendar
+
+      final_nationality_driver_aggregation:
+        +schema: final_nationality_driver_aggregation
+
+      final_driver_flags_ns:
+        +schema: final_driver_flags_ns
 
       final_driver_badges_list:
         +schema: final_driver_badges_list
