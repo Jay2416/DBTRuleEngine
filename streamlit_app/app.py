@@ -35,6 +35,8 @@ MINIO_ENDPOINT = "http://minio:9000"  # <-- Update this
 MINIO_ACCESS_KEY = "admin"                # <-- Update this
 MINIO_SECRET_KEY = "password123"                # <-- Update this
 MINIO_BUCKET = "formula1"
+FINAL_RULES_SCHEMA = "final_rules"
+SNAPSHOT_RETAIN_LAST = 8
 
 @st.cache_resource
 def get_s3_client():
@@ -102,11 +104,44 @@ def run_query(query):
     finally:
         conn.close()
 
+def _extract_write_table_refs(query):
+    """Extract target table names from write SQL statements for snapshot housekeeping."""
+    if not isinstance(query, str):
+        return []
+
+    matches = re.findall(r"(?i)\b(?:insert\s+into|update|delete\s+from|merge\s+into)\s+([a-zA-Z0-9_`.]+)", query)
+    refs = []
+    for raw in matches:
+        token = raw.strip().strip('`')
+        parts = [p.strip('`') for p in token.split('.') if p]
+        if len(parts) == 3:
+            catalog, schema, table = parts
+            if catalog.lower() == AUTH_CATALOG.lower():
+                refs.append(f"{schema}.{table}")
+        elif len(parts) == 2:
+            schema, table = parts
+            refs.append(f"{schema}.{table}")
+        elif len(parts) == 1:
+            refs.append(f"{AUTH_SCHEMA}.{parts[0]}")
+    return list(dict.fromkeys(refs))
+
+def _expire_snapshots_for_refs(cursor, table_refs):
+    """Retain only the latest N snapshots for modified Iceberg tables."""
+    for table_ref in table_refs:
+        try:
+            cursor.execute(
+                f"CALL {AUTH_CATALOG}.system.expire_snapshots(table => '{table_ref}', retain_last => {SNAPSHOT_RETAIN_LAST})"
+            )
+        except Exception:
+            # Keep business write successful even if snapshot cleanup is unsupported/intermittent.
+            pass
+
 def run_update(query):
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute(query)
+        _expire_snapshots_for_refs(cursor, _extract_write_table_refs(query))
         return True
     except Exception as e:
         st.error(f"Database Write Error: {e}")
@@ -334,6 +369,99 @@ def ensure_non_sequential_rules_ephemeral(group_id, group_name):
         return False, f"Missing rule SQL file(s): {', '.join(missing_files)}"
 
     return True, "All non-sequential rules are set to ephemeral."
+
+def build_live_rule_preview_sql(
+    macro_tables,
+    macro_joins,
+    macro_select_cols,
+    macro_aggs,
+    macro_where,
+    macro_group_by,
+    macro_having,
+    macro_order,
+    macro_limit,
+):
+    """Render clean SQL preview directly from current UI state without macro expansion."""
+    lines = []
+
+    if macro_tables:
+        cte_chunks = [f"{tbl} AS (\n  SELECT * FROM {tbl}\n)" for tbl in macro_tables]
+        lines.append("WITH")
+        lines.append(",\n".join(cte_chunks))
+
+    select_items = list(macro_select_cols)
+    for agg in macro_aggs:
+        if agg.get('func') and agg.get('col'):
+            alias = agg.get('alias', '').strip()
+            expr = f"{agg['func']}({agg['col']})"
+            select_items.append(f"{expr} AS {alias}" if alias else expr)
+
+    lines.append("SELECT")
+    if select_items:
+        lines.append("  " + ",\n  ".join(select_items))
+    else:
+        lines.append("  *")
+
+    if macro_tables:
+        lines.append(f"FROM {macro_tables[0]}")
+
+    for j in macro_joins:
+        if j.get('type') and j.get('table') and j.get('left') and j.get('right'):
+            lines.append(f"{j['type']} {j['table']} ON {j['left']} = {j['right']}")
+
+    where_clauses = []
+    for idx, w in enumerate(macro_where):
+        col = w.get('col', '')
+        op = w.get('op', '')
+        val = w.get('value', '')
+        val2 = w.get('value2', '')
+        if not col or not op:
+            continue
+
+        if op in ['IS NULL', 'IS NOT NULL']:
+            expr = f"{col} {op}"
+        elif op == 'BETWEEN':
+            expr = f"{col} BETWEEN {val} AND {val2}"
+        else:
+            expr = f"{col} {op} {val}"
+
+        if idx == 0 or not where_clauses:
+            where_clauses.append(expr)
+        else:
+            where_clauses.append(f"{w.get('logic', 'AND')} {expr}")
+
+    if where_clauses:
+        lines.append("WHERE")
+        lines.append("  " + "\n  ".join(where_clauses))
+
+    if macro_group_by:
+        lines.append("GROUP BY")
+        lines.append("  " + ",\n  ".join(macro_group_by))
+
+    having_clauses = []
+    for idx, h in enumerate(macro_having):
+        if not (h.get('func') and h.get('col') and h.get('op')):
+            continue
+        expr = f"{h['func']}({h['col']}) {h['op']} {h.get('value', '')}"
+        if idx == 0 or not having_clauses:
+            having_clauses.append(expr)
+        else:
+            having_clauses.append(f"{h.get('logic', 'AND')} {expr}")
+
+    if having_clauses:
+        lines.append("HAVING")
+        lines.append("  " + "\n  ".join(having_clauses))
+
+    if macro_order:
+        order_items = [f"{o['col']} {o['dir']}" for o in macro_order if o.get('col') and o.get('dir')]
+        if order_items:
+            lines.append("ORDER BY")
+            lines.append("  " + ",\n  ".join(order_items))
+
+    if macro_limit and str(macro_limit) != 'None':
+        lines.append(f"LIMIT {macro_limit}")
+
+    return "\n".join(lines)
 
 def resolve_group_relation_name(value, relation_map):
     """Resolve a table token to either an in-group CTE name or external model name."""
@@ -649,6 +777,16 @@ def get_manager_user_id():
         return result[0][0]
     return None
 
+def get_role_approval_level(role_name):
+    """Return approval level by role for auto-approval routing."""
+    level_map = {
+        "CREATOR": 0,
+        "MANAGER": 1,
+        "TECHNICAL": 2,
+        "SME": 3,
+    }
+    return level_map.get(str(role_name or "").upper(), 0)
+
 def get_rules_for_approval(level_id):
     """Fetches rules assigned to a specific level for approval."""
     sql = f"""
@@ -687,6 +825,7 @@ def get_group_rule_rows(group_id):
 
 def upsert_rule_approval_step(rule_id, level_id, action, comments, user_id, action_ts):
     """Upsert one approval_workflow row for a rule+level to keep audit history consistent."""
+    user_id_sql = "NULL" if user_id in [None, "", "NULL"] else f"'{user_id}'"
     existing_sql = f"""
     SELECT approval_id
     FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
@@ -700,7 +839,7 @@ def upsert_rule_approval_step(rule_id, level_id, action, comments, user_id, acti
         approval_id = existing[0][0]
         upd_sql = f"""
         UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
-        SET action = '{action}', comments = '{comments}', user_id = '{user_id}', action_date = CAST('{action_ts}' AS TIMESTAMP)
+        SET action = '{action}', comments = '{comments}', user_id = {user_id_sql}, action_date = CAST('{action_ts}' AS TIMESTAMP)
         WHERE approval_id = {approval_id}
         """
         return run_update(upd_sql)
@@ -709,7 +848,7 @@ def upsert_rule_approval_step(rule_id, level_id, action, comments, user_id, acti
     ins_sql = f"""
     INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow
     (approval_id, rule_id, user_id, level_id, action, comments, action_date)
-    VALUES ({new_id}, {int(rule_id)}, '{user_id}', {int(level_id)}, '{action}', '{comments}', CAST('{action_ts}' AS TIMESTAMP))
+    VALUES ({new_id}, {int(rule_id)}, {user_id_sql}, {int(level_id)}, '{action}', '{comments}', CAST('{action_ts}' AS TIMESTAMP))
     """
     return run_update(ins_sql)
 
@@ -1231,7 +1370,6 @@ def setup_new_group_environment(group_name):
         
     # The exact strings to inject
     rules_str = f"      {safe_group}:\n        +schema: {safe_group}\n"
-    final_rules_str = f"\n      final_{safe_group}:\n        +schema: final_{safe_group}\n"
     
     # Prevent duplicate entries if a user tries to recreate a group
     content_str = "".join(lines)
@@ -1252,11 +1390,10 @@ def setup_new_group_environment(group_name):
             new_lines.append(rules_str)
             in_rules = False
             
-        # Inject under final_rules
+        # Keep all final outputs in shared final_rules schema via per-model config.
         if line.strip() == "final_rules:":
             in_final_rules = True
         elif in_final_rules and line.strip() == "+schema: final_rules":
-            new_lines.append(final_rules_str)
             in_final_rules = False
             
     # Write the updated lines back to the file
@@ -1312,7 +1449,7 @@ def generate_group_sql(group_id, group_name):
         # Reference group rule model names directly so ephemeral models compile as CTEs.
         rule_models = [safe_model_name(r[1]) for r in rules]
         
-        generated_sql = f"""{{{{ config(materialized='table') }}}}
+        generated_sql = f"""{{{{ config(materialized='table', schema='{FINAL_RULES_SCHEMA}', alias='{safe_group}') }}}}
 
 {{{{ non_sequential_rule_engine(
     rule_models={rule_models},
@@ -1432,7 +1569,7 @@ def generate_group_sql(group_id, group_name):
             }
             group_steps.append(step_dict)
 
-        generated_sql = f"""{{{{ config(materialized='table') }}}}
+        generated_sql = f"""{{{{ config(materialized='table', schema='{FINAL_RULES_SCHEMA}', alias='{safe_group}') }}}}
 
 {{{{ sequential_rule_engine(
     steps={group_steps}
@@ -1617,7 +1754,10 @@ else:
         clear_session_for_role(role)
         st.session_state._last_active_role = role
 
-    if role == 'CREATOR':
+    if 'mgr_show_rule_builder' not in st.session_state:
+        st.session_state.mgr_show_rule_builder = False
+
+    if role == 'CREATOR' or (role in ['MANAGER', 'TECHNICAL', 'SME'] and st.session_state.get('mgr_show_rule_builder', False)):
         # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
         # Fetch DB F1 Schemas dynamically from MinIO Iceberg Metadata
         try:
@@ -1989,12 +2129,20 @@ else:
             else:
                 st.info("No groups currently exist in the database.")
     
-    elif role in ["MANAGER", "TECHNICAL", "SME"]:
+    elif role in ["MANAGER", "TECHNICAL", "SME"] and not st.session_state.get("mgr_show_rule_builder", False):
         st.title(f"✅ {role.capitalize()} Approval Workspace")
         
         # Map role to numeric level
         level_map = {"MANAGER": 1, "TECHNICAL": 2, "SME": 3}
         my_level = level_map[role]
+
+        st.divider()
+        st.markdown("### Rule Builder Access")
+        st.caption("Enable this to create/update rules. New/updated rules are auto-approved up to your role level.")
+        st.checkbox(
+            "Open Rule Builder",
+            key="mgr_show_rule_builder"
+        )
 
         if role == "MANAGER":
             st.markdown("### Group Approval")
@@ -2084,9 +2232,15 @@ else:
                                 time.sleep(1.5)
                                 st.rerun()
         
-    elif role == "CREATOR":
+    elif role == "CREATOR" or (role in ["MANAGER", "TECHNICAL", "SME"] and st.session_state.get("mgr_show_rule_builder", False)):
         # --- MAIN QUERY BUILDER AREA ---
         st.title("Rule Registry: Manage Business Logic")
+
+        if role in ["MANAGER", "TECHNICAL", "SME"]:
+            st.caption(f"Signed in as {role}. Rules saved here are auto-approved up to your level.")
+            if st.button("Return to Approval Workspace", key="back_to_mgr_workspace"):
+                st.session_state.mgr_show_rule_builder = False
+                st.rerun()
 
         clean_name = lambda x: str(x) if x else ""
         
@@ -2741,7 +2895,19 @@ else:
             
             if st.session_state.active_group_mode == 'sequential':
                 st.info("🔄 **Sequential Group.** This draft file is for review purposes. Upon full approval, a unified macro will execute the sequence.")
-            st.code(generated_sql, language="sql")
+
+            live_preview_sql = build_live_rule_preview_sql(
+                macro_tables,
+                macro_joins,
+                macro_select_cols,
+                macro_aggs,
+                macro_where,
+                macro_group_by,
+                macro_having,
+                macro_order,
+                macro_limit,
+            )
+            st.code(live_preview_sql, language="sql")
 
             col_btn1, col_btn2 = st.columns([2, 8])
             with col_btn1:
@@ -2838,25 +3004,77 @@ else:
                                                     })
                                                 update_rule_sequence_batch(batch_payload)
 
-                                        manager_id = get_manager_user_id()
-                                        manager_id_sql = f"'{manager_id}'" if manager_id else "NULL"
+                                            actor_role = str(user.get('role', '')).upper()
+                                            actor_level = get_role_approval_level(actor_role)
+                                            actor_user_id = user.get('user_id')
 
-                                        if action_mode == "Create New Rule":
-                                            approval_id = get_next_approval_id()
-                                            run_update(f"INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow (approval_id, rule_id, user_id, level_id, action, comments, action_date) VALUES ({approval_id}, {final_insert_id}, {manager_id_sql}, 1, 'PENDING', 'Rule submitted and awaiting Level 1 (Manager) review.', CAST('{now}' AS TIMESTAMP))")
-                                            st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
-                                        else:
-                                            # Reuse existing approval rows during update; do not create new entries.
-                                            has_approval_sql = f"SELECT count(*) FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow WHERE rule_id = {final_insert_id}"
-                                            has_approval_res = run_query(has_approval_sql)
-                                            has_existing_rows = bool(has_approval_res and has_approval_res[0][0] > 0)
+                                            for level in [1, 2, 3]:
+                                                if level <= actor_level:
+                                                    step_action = 'APPROVED'
+                                                    step_comment = f"Auto-approved at Level {level} by {actor_role} during rule save."
+                                                    step_user_id = actor_user_id
+                                                elif level == actor_level + 1:
+                                                    step_action = 'PENDING'
+                                                    step_comment = f"Awaiting Level {level} review."
+                                                    step_user_id = None
+                                                else:
+                                                    step_action = 'WAITING'
+                                                    step_comment = 'Waiting for prior level approval.'
+                                                    step_user_id = None
 
-                                            if has_existing_rows:
-                                                run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'PENDING', comments = 'Rule updated and awaiting Level 1 (Manager) review.', user_id = {manager_id_sql}, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id = 1")
-                                                run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.approval_workflow SET action = 'WAITING', comments = 'Waiting for prior level approval.', user_id = NULL, action_date = CAST('{now}' AS TIMESTAMP) WHERE rule_id = {final_insert_id} AND level_id IN (2, 3)")
-                                                st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
+                                                upsert_rule_approval_step(
+                                                    final_insert_id,
+                                                    level,
+                                                    step_action,
+                                                    step_comment,
+                                                    step_user_id,
+                                                    now
+                                                )
+
+                                            if actor_level >= 3:
+                                                run_update(
+                                                    f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow "
+                                                    f"SET status = 'ACTIVE', updated_at = CAST('{now}' AS TIMESTAMP) "
+                                                    f"WHERE rule_id = {final_insert_id}"
+                                                )
+
+                                                can_execute_group = True
+                                                if st.session_state.active_group_mode != 'non_sequential':
+                                                    success_copy, copy_msg = create_final_rule_file(r_name)
+                                                    if not success_copy:
+                                                        st.error(f"❌ Rule approved to ACTIVE, but final file copy failed: {copy_msg}")
+                                                        st.info(f"📁 Draft script written to: `{dbt_filepath}`")
+                                                        can_execute_group = False
+
+                                                if can_execute_group and check_group_fully_approved(st.session_state.active_group_id):
+                                                    success_exec, exec_msg = execute_dbt_group(st.session_state.active_group_name)
+                                                    if success_exec:
+                                                        st.success(
+                                                            f"✅ Rule '{r_name}' is ACTIVE. Group fully approved and master model executed."
+                                                        )
+                                                    elif can_execute_group:
+                                                        st.error(
+                                                            f"⚠️ Rule is ACTIVE and group is approved, but execution failed: {exec_msg}"
+                                                        )
+                                                elif can_execute_group:
+                                                    st.success(
+                                                        f"✅ Rule '{r_name}' is ACTIVE. Waiting for remaining rules in this group before group execution."
+                                                    )
+                                            elif actor_level == 0:
+                                                if action_mode == "Create New Rule":
+                                                    st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+                                                else:
+                                                    st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
                                             else:
-                                                st.warning("Rule updated in rule_workflow, but no existing approval_workflow row was found to reuse.")
+                                                next_level = actor_level + 1
+                                                if action_mode == "Create New Rule":
+                                                    st.success(
+                                                        f"✅ Rule '{r_name}' saved. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                                    )
+                                                else:
+                                                    st.success(
+                                                        f"✅ Rule '{r_name}' updated. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                                    )
 
                                         st.info(f"📁 Draft script written to: `{dbt_filepath}`")
                                     else:
