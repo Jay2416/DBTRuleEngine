@@ -1,0 +1,5 @@
+{{ config(materialized='table', schema='final_rules', alias='seq_test') }}
+
+{{ sequential_rule_engine(
+    steps=[{'rule_name': 'winners_base', 'sequence_order': 1000, 'primary_table': 'stg_results', 'is_primary_cte': False, 'select_columns': ['stg_results.race_id', 'stg_results.driver_id', 'stg_results.points_scored', 'stg_results.finishing_position'], 'aggregations': [], 'joins': [{'type': 'INNER JOIN', 'table': 'stg_races', 'is_cte': False, 'left': 'stg_results.race_id', 'right': 'stg_races.race_id'}], 'where_filters': [{'col': 'stg_results.finishing_position', 'op': '=', 'value': '1', 'value2': '', 'logic': 'AND'}], 'group_by': [], 'having': [], 'order_by': [], 'limit_rows': 'None'}, {'rule_name': 'winners_high', 'sequence_order': 2000, 'primary_table': 'winners_base', 'is_primary_cte': True, 'select_columns': ['winners_base.driver_id', 'winners_base.race_id', 'winners_base.points_scored'], 'aggregations': [], 'joins': [], 'where_filters': [{'col': 'winners_base.points_scored', 'op': '>=', 'value': '24', 'value2': '', 'logic': 'AND'}], 'group_by': [], 'having': [], 'order_by': [], 'limit_rows': 'None'}]
+) }}

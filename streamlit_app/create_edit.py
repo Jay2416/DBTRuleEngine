@@ -194,9 +194,13 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                                 f"'{key_col}'" if key_col else "NULL",
                             ]
 
+                            # Always populate compatibility column so table insert works
+                            # whether rule_group has `remark` or legacy `target_column`.
+                            insert_cols.append(group_remark_field)
                             if new_g_mode == "non_sequential":
-                                insert_cols.append(group_remark_field)
                                 insert_vals.append("'remark'")
+                            else:
+                                insert_vals.append("NULL")
 
                             sql = f"""
                                 INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group

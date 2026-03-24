@@ -1302,17 +1302,17 @@ def generate_group_sql(group_id, group_name):
             token = token.split(".")[-1]
         return token
 
-    key_column = normalize_column_token(key_column)
-    remark_column = normalize_column_token(remark_column)
-    if not key_column or not remark_column:
-        return False, "Group key/remark columns are required for non-sequential execution."
-    
     safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     
     # ==========================================
     # BRANCH A: NON-SEQUENTIAL EXECUTION
     # ==========================================
     if exec_mode == 'non_sequential':
+        key_column = normalize_column_token(key_column)
+        remark_column = normalize_column_token(remark_column)
+        if not key_column or not remark_column:
+            return False, "Group key/remark columns are required for non-sequential execution."
+
         ok_ephemeral, ep_msg = ensure_non_sequential_rules_ephemeral(group_id, group_name)
         if not ok_ephemeral:
             return False, ep_msg

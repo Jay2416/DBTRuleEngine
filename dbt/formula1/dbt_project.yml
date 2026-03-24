@@ -39,6 +39,10 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      driver_race_summary:
+        +schema: driver_race_summary
+      seq_test:
+        +schema: seq_test
       driver_test:
         +schema: driver_test
       testing_ns:
