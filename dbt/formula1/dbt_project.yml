@@ -39,6 +39,8 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      test_group:
+        +schema: test_group
       front_grid_starters:
         +schema: front_grid_starters
       driver_podium_history:
