@@ -114,29 +114,6 @@ CREATE NAMESPACE IF NOT EXISTS formula1_catalog.default;
 CREATE NAMESPACE IF NOT EXISTS formula1_catalog.staging;
 CREATE NAMESPACE IF NOT EXISTS formula1_catalog.rules;
 CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_rules;
-
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.driver_test;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.testing_ns;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.test_group;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.front_grid_starters;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.driver_podium_history;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.yearly_race_calendar;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.nationality_driver_aggregation;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.driver_flags_ns;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.driver_badges_list;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.all_time_wins_leaderboard;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.testing_group;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.championship_standings_2023;
-
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_front_grid_starters;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_driver_podium_history;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_yearly_race_calendar;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_nationality_driver_aggregation;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_driver_flags_ns;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_driver_badges_list;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_all_time_wins_leaderboard;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_testing_group;
-CREATE NAMESPACE IF NOT EXISTS formula1_catalog.final_championship_standings_2023;
 ```
 
 ### 3. Verify namespaces were created
