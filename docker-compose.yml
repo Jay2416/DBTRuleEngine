@@ -27,6 +27,28 @@ services:
       - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
     networks:
       - iceberg_net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # -------------------- Spark Worker 2 --------------------
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker-2
+    depends_on:
+      - spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    volumes:
+      - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    networks:
+      - iceberg_net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
 
 
@@ -76,6 +98,10 @@ services:
       --conf spark.hive.server2.transport.mode=binary
       --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
       spark-internal
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
 
   # -------------------- dbt --------------------
   dbt:
@@ -137,6 +163,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - PYTHONUNBUFFERED=1
+      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=poll
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true
     networks:
       - iceberg_net
 

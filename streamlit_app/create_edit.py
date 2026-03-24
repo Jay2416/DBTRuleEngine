@@ -1,4 +1,5 @@
 import datetime
+import os
 import re
 import time
 import uuid
@@ -41,6 +42,61 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
     TABLE_SCHEMAS = dict(table_schemas)
     TABLE_NAMES = list(table_names)
 
+    def normalize_column_token(col_name):
+        if not isinstance(col_name, str):
+            return ""
+        return re.sub(r"[^a-zA-Z0-9]", "", col_name).lower()
+
+    def resolve_key_for_table(table_name, group_key_column):
+        key_norm = normalize_column_token(group_key_column)
+        for col in TABLE_SCHEMAS.get(table_name, []):
+            if normalize_column_token(col) == key_norm:
+                return col
+        return None
+
+    def load_explanation_id_columns():
+        candidate_paths = [
+            os.path.join("/", "dbt", "formula1", "Explanation.md"),
+            os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "dbt", "formula1", "Explanation.md")),
+        ]
+        for path in candidate_paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                tokens = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", content)
+                id_tokens = [t for t in tokens if t.lower().endswith("id")]
+                if id_tokens:
+                    deduped = []
+                    for tok in id_tokens:
+                        if tok not in deduped:
+                            deduped.append(tok)
+                    return deduped
+            except Exception:
+                continue
+        return []
+
+    def get_key_column_options_from_explanation():
+        doc_ids = load_explanation_id_columns()
+        schema_cols = {
+            col
+            for cols in TABLE_SCHEMAS.values()
+            for col in cols
+            if normalize_column_token(col)
+        }
+        if doc_ids:
+            doc_norm = {normalize_column_token(c) for c in doc_ids}
+            matched = sorted([c for c in schema_cols if normalize_column_token(c) in doc_norm])
+            if matched:
+                return matched
+
+        fallback = sorted([c for c in schema_cols if normalize_column_token(c).endswith("id")])
+        return fallback
+
+    get_rule_group_non_seq_config = ctx.get("get_rule_group_non_seq_config")
+    get_rule_group_columns = ctx.get("get_rule_group_columns")
+    group_columns = set(get_rule_group_columns() or []) if callable(get_rule_group_columns) else set()
+    group_remark_field = "remark" if "remark" in group_columns else "target_column"
+
     st.title("Rule Registry: Manage Business Logic")
 
     if role in ["MANAGER", "TECHNICAL", "SME"]:
@@ -80,28 +136,29 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                 new_g_name = st.text_input("New Group Name:", placeholder="e.g., Fraud_Risk_Scoring")
                 new_g_mode = st.radio("Execution Mode:", ["non_sequential", "sequential"], horizontal=True)
 
-                source_tbl = ""
                 key_col = ""
-                target_col = ""
 
                 if new_g_mode == "non_sequential":
                     with st.container(border=True):
                         st.markdown("##### ⚙️ Non-Sequential Configuration")
-                        st.caption("Define the base table and how parallel rules should be aggregated.")
+                        st.caption("Select the grouping key. Rule remark text will be set per rule.")
 
-                        source_tbl = st.selectbox("Base Source Table:", TABLE_NAMES, key="new_grp_src", format_func=clean_name)
-                        avail_cols = TABLE_SCHEMAS.get(source_tbl, []) if source_tbl else []
-                        key_col = st.selectbox(
-                            "Grouping Key (e.g., id):",
-                            avail_cols,
-                            key="new_grp_key",
-                            help="The primary key used to GROUP BY and stack the rules.",
-                        )
-                        target_col = st.text_input(
-                            "Target Column to ListAgg:",
-                            placeholder="e.g., triggered_rules",
-                            key="new_grp_tgt",
-                            help="The name of the new column that will hold the comma-separated values.",
+                        key_options = get_key_column_options_from_explanation()
+                        if not key_options:
+                            st.error("No ID-style key columns were found from schemas.")
+                        else:
+                            key_col = st.selectbox(
+                                "Grouping Key (ID column):",
+                                key_options,
+                                key="new_grp_key",
+                                help="Only tables containing this key will be available while authoring rules in this group.",
+                            )
+
+                        st.text_input(
+                            "Output Remark Column:",
+                            value="remark",
+                            disabled=True,
+                            help="Fixed output column for non-sequential aggregation.",
                         )
 
         with col2:
@@ -113,22 +170,39 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
             else:
                 if st.button("💾 Save Group", type="primary", use_container_width=True):
                     if new_g_name:
-                        if new_g_mode == "non_sequential" and not (source_tbl and key_col and target_col):
-                            st.error("⚠️ Please fill in the Source Table, Grouping Key, and Target Column for non-sequential execution.")
+                        if new_g_mode == "non_sequential" and not key_col:
+                            st.error("⚠️ Please select a Grouping Key for non-sequential execution.")
                         else:
                             new_id = get_next_group_id()
                             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             current_user = user["username"]
 
-                            st_val = f"'{source_tbl}'" if source_tbl else "NULL"
-                            kc_val = f"'{key_col}'" if key_col else "NULL"
-                            tc_val = f"'{target_col}'" if target_col else "NULL"
+                            insert_cols = [
+                                "group_id",
+                                "group_name",
+                                "execution_mode",
+                                "created_by",
+                                "created_at",
+                                "key_column",
+                            ]
+                            insert_vals = [
+                                str(new_id),
+                                f"'{new_g_name}'",
+                                f"'{new_g_mode}'",
+                                f"'{current_user}'",
+                                f"CAST('{now}' AS TIMESTAMP)",
+                                f"'{key_col}'" if key_col else "NULL",
+                            ]
+
+                            if new_g_mode == "non_sequential":
+                                insert_cols.append(group_remark_field)
+                                insert_vals.append("'remark'")
 
                             sql = f"""
                                 INSERT INTO {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group
-                                (group_id, group_name, execution_mode, created_by, created_at, source_table, key_column, target_column)
+                                ({', '.join(insert_cols)})
                                 VALUES
-                                ({new_id}, '{new_g_name}', '{new_g_mode}', '{current_user}', CAST('{now}' AS TIMESTAMP), {st_val}, {kc_val}, {tc_val})
+                                ({', '.join(insert_vals)})
                                 """
 
                             if run_update(sql):
@@ -153,7 +227,31 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
         with st.container(border=True):
             st.markdown(f"#### 2. Rule Definitions for: {st.session_state.active_group_name}")
 
+            previous_action_mode = st.session_state.get("prev_action_mode", "Create New Rule")
             action_mode = st.radio("Action:", ["Create New Rule", "Update Existing Rule"], horizontal=True)
+
+            # --- NEW FIX: WIPE THE CANVAS WHEN SWITCHING TO 'CREATE NEW RULE' ---
+            if action_mode != previous_action_mode:
+                st.session_state.prev_action_mode = action_mode
+                if action_mode == "Create New Rule":
+                    _clear_dynamic_widget_keys()
+                    st.session_state.joins = []
+                    st.session_state.aggregations = []
+                    st.session_state.having_filters = []
+                    st.session_state.manual_group_by = []
+                    if "row_limit" in st.session_state:
+                        del st.session_state["row_limit"]
+                    st.session_state.where_filters = [{"id": str(uuid.uuid4()), "col": "", "op": "equals (=)", "val": "", "val2": "", "logic": "AND"}]
+                    st.session_state.order_filters = [{"id": str(uuid.uuid4()), "col": "", "dir": "ASC"}]
+                    st.session_state.loaded_primary_table = None
+                    st.session_state.loaded_primary_columns = None
+                    st.session_state.loaded_cols_joins = None
+                    st.session_state.last_selected_rule = None
+                    if "rule_remark_text" in st.session_state:
+                        del st.session_state["rule_remark_text"]
+                    if "t1" in st.session_state:
+                        del st.session_state["t1"]
+                    st.rerun() # Force immediate UI refresh with clean state
 
             if action_mode == "Create New Rule":
                 st.session_state.currently_loaded_rule = None
@@ -184,7 +282,16 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                     current_id = None
                     r_name = ""
 
+            rule_remark_text = st.session_state.get("rule_remark_text", "")
             if r_name or action_mode == "Create New Rule":
+                if st.session_state.active_group_mode == "non_sequential":
+                    rule_remark_text = st.text_input(
+                        "Rule Remark (Compulsory)",
+                        key="rule_remark_text",
+                        placeholder="e.g., Q3 Contender",
+                        help="This remark is appended for matching keys when this rule is triggered.",
+                    )
+
                 st.divider()
 
                 if st.session_state.active_group_mode == "sequential":
@@ -228,6 +335,15 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                     st.info("ℹ️ Group is non-sequential. All rules run in parallel.")
                     sequence_order = 0
 
+    active_group_key_column = ""
+    active_group_remark_column = "remark"
+    if st.session_state.active_group_id and st.session_state.get("active_group_mode") == "non_sequential":
+        if callable(get_rule_group_non_seq_config):
+            cfg = get_rule_group_non_seq_config(st.session_state.active_group_id)
+            if cfg:
+                active_group_key_column = cfg.get("key_column", "")
+                active_group_remark_column = cfg.get("remark_column", "remark")
+
     all_rules_global = get_existing_rules()
     group_rules_only = get_existing_rules(group_id=st.session_state.active_group_id)
 
@@ -244,9 +360,22 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
         group_rule_models.add(f"final_{safe_name}")
 
     TABLE_NAMES = [t for t in TABLE_SCHEMAS.keys() if (t not in all_rule_models) or (t in group_rule_models)]
+    JOIN_TABLE_NAMES = list(TABLE_NAMES)
+
+    if st.session_state.get("active_group_mode") == "non_sequential" and active_group_key_column:
+        key_norm = normalize_column_token(active_group_key_column)
+        TABLE_NAMES = [
+            t
+            for t in TABLE_NAMES
+            if any(normalize_column_token(c) == key_norm for c in TABLE_SCHEMAS.get(t, []))
+        ]
 
     if st.session_state.get("t1") and st.session_state["t1"] not in TABLE_NAMES:
         del st.session_state["t1"]
+
+    if not TABLE_NAMES:
+        st.error("No tables are available for this group key column. Please check group key configuration.")
+        return
 
     clean_name = lambda x: x
 
@@ -255,6 +384,8 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
     with col_src1:
         with st.container(border=True):
             st.markdown("#### 3. Data Sources & Joins")
+
+            join_table_options = JOIN_TABLE_NAMES if st.session_state.get("active_group_mode") == "non_sequential" else TABLE_NAMES
 
             if "t1" in st.session_state:
                 t1 = st.selectbox("Select Primary Table:", TABLE_NAMES, key="t1", format_func=clean_name)
@@ -271,10 +402,12 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
 
                 t_right_key = f"t_right_{uid}"
                 if t_right_key in st.session_state:
-                    join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, key=t_right_key, format_func=clean_name)
+                    join_data["right_table"] = st.selectbox("Table to Join:", join_table_options, key=t_right_key, format_func=clean_name)
                 else:
-                    right_table_idx = safe_index(TABLE_NAMES, join_data.get("right_table"))
-                    join_data["right_table"] = st.selectbox("Table to Join:", TABLE_NAMES, index=right_table_idx, key=t_right_key, format_func=clean_name)
+                    right_table_idx = safe_index(join_table_options, join_data.get("right_table"))
+                    join_data["right_table"] = st.selectbox(
+                        "Table to Join:", join_table_options, index=right_table_idx, key=t_right_key, format_func=clean_name
+                    )
 
                 join_types = ["LEFT JOIN", "INNER JOIN", "RIGHT JOIN", "FULL OUTER JOIN", "CROSS JOIN"]
                 j_type_key = f"j_type_{uid}"
@@ -344,22 +477,49 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
             st.caption("Select the columns you want to pass through to the final rule output.")
 
             primary_cols_key = f"primary_cols_{t1}"
-            if primary_cols_key not in st.session_state:
-                st.session_state[primary_cols_key] = TABLE_SCHEMAS.get(t1, [])[:3]
+            cols_t1 = []
 
-            cols_t1 = st.multiselect(f"Output Columns for {clean_name(t1)}:", TABLE_SCHEMAS.get(t1, []), key=primary_cols_key)
+            if st.session_state.active_group_mode == "non_sequential" and active_group_key_column:
+                resolved_key = resolve_key_for_table(t1, active_group_key_column)
+                if not resolved_key:
+                    st.error(
+                        f"Primary table '{clean_name(t1)}' does not contain configured key column '{active_group_key_column}'."
+                    )
+                else:
+                    st.session_state[primary_cols_key] = [resolved_key]
+                    cols_t1 = st.multiselect(
+                        f"Output Column for {clean_name(t1)}:",
+                        [resolved_key],
+                        default=[resolved_key],
+                        max_selections=1,
+                        key=primary_cols_key,
+                        disabled=True,
+                        help="Non-sequential mode uses a single fixed key output column.",
+                    )
+            else:
+                if primary_cols_key not in st.session_state:
+                    st.session_state[primary_cols_key] = TABLE_SCHEMAS.get(t1, [])[:3]
+                cols_t1 = st.multiselect(
+                    f"Output Columns for {clean_name(t1)}:",
+                    TABLE_SCHEMAS.get(t1, []),
+                    key=primary_cols_key,
+                )
 
             cols_joins = {}
             for join_data in st.session_state.joins:
                 r_table = join_data.get("right_table")
                 if r_table and r_table not in cols_joins:
-                    out_col_key = f"out_col_{r_table}"
-                    if out_col_key not in st.session_state:
-                        st.session_state[out_col_key] = TABLE_SCHEMAS.get(r_table, [])[:3]
+                    if st.session_state.active_group_mode == "non_sequential":
+                        st.caption(f"Output for {clean_name(r_table)} is disabled in non-sequential mode.")
+                        cols_joins[r_table] = []
+                    else:
+                        out_col_key = f"out_col_{r_table}"
+                        if out_col_key not in st.session_state:
+                            st.session_state[out_col_key] = TABLE_SCHEMAS.get(r_table, [])[:3]
 
-                    cols_joins[r_table] = st.multiselect(
-                        f"Output Columns for {clean_name(r_table)}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key
-                    )
+                        cols_joins[r_table] = st.multiselect(
+                            f"Output Columns for {clean_name(r_table)}:", TABLE_SCHEMAS.get(r_table, []), key=out_col_key
+                        )
 
     available_columns = [f"{t1}.{c}" for c in TABLE_SCHEMAS.get(t1, [])]
     for r_table in cols_joins.keys():
@@ -719,6 +879,20 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
         macro_order = [{"col": o["col"], "dir": o["dir"]} for o in st.session_state.order_filters if o.get("col")]
         macro_limit = st.session_state.get("row_limit") or "None"
 
+        if st.session_state.active_group_mode == "non_sequential":
+            resolved_key = resolve_key_for_table(t1, active_group_key_column)
+            escaped_remark = str(rule_remark_text or "").replace("'", "''")
+            if resolved_key:
+                macro_select_cols = [
+                    f"{t1}.{resolved_key}",
+                    f"'{escaped_remark}' AS {active_group_remark_column}",
+                ]
+            else:
+                macro_select_cols = [f"'{escaped_remark}' AS {active_group_remark_column}"]
+            macro_group_by = []
+            macro_having = []
+            macro_aggs = []
+
         rule_materialization = "ephemeral" if st.session_state.active_group_mode == "non_sequential" else "table"
 
         generated_sql = f"""{{{{ config(materialized='{rule_materialization}') }}}}
@@ -750,23 +924,29 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
             if st.button("Run Query & Save to DBT", type="primary"):
                 if not r_name:
                     st.error("Please enter a Rule Name before running.")
+                elif st.session_state.active_group_mode == "non_sequential" and not str(rule_remark_text or "").strip():
+                    st.error("Please enter Rule Remark for this non-sequential rule.")
                 else:
                     passed_schema_check = True
 
                     if st.session_state.active_group_mode == "non_sequential":
-                        grp_sql = f"SELECT key_column, target_column FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {st.session_state.active_group_id}"
-                        grp_res = run_query(grp_sql)
-                        req_key = grp_res[0][0]
-                        req_tgt = grp_res[0][1]
+                        req_key = active_group_key_column
+                        req_tgt = active_group_remark_column
 
-                        final_output_cols = [c.split(".")[-1] for c in macro_select_cols]
+                        final_output_cols = []
+                        for c in macro_select_cols:
+                            alias_match = re.search(r"\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", c, flags=re.IGNORECASE)
+                            if alias_match:
+                                final_output_cols.append(alias_match.group(1))
+                            else:
+                                final_output_cols.append(c.split(".")[-1].strip())
                         final_output_cols.extend([a["alias"] for a in macro_aggs if a.get("alias")])
 
                         missing_cols = []
                         if req_key not in final_output_cols:
                             missing_cols.append(f"`{req_key}` (Grouping Key)")
                         if req_tgt not in final_output_cols:
-                            missing_cols.append(f"`{req_tgt}` (Target Column)")
+                            missing_cols.append(f"`{req_tgt}` (Remark Column)")
 
                         if missing_cols:
                             passed_schema_check = False
@@ -774,7 +954,7 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                                 f"❌ **Schema Mismatch:** This rule belongs to a non-sequential group. Your final output MUST contain: {', '.join(missing_cols)}."
                             )
                             st.info(
-                                "💡 *Tip: Ensure you selected these columns in Step 4, or use an Aggregation Alias to rename a calculated field to match the Target Column.*"
+                                "💡 *Tip: Non-sequential mode requires fixed key output and the rule remark output column.*"
                             )
 
                     if passed_schema_check:
@@ -793,6 +973,7 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                                 "where_filters": st.session_state.where_filters,
                                 "order_filters": st.session_state.order_filters,
                                 "sequence_order": sequence_order,
+                                "rule_remark": rule_remark_text,
                             }
 
                             save_ui_state(r_name, st.session_state.active_group_name, ui_state)
@@ -842,77 +1023,77 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                                                 )
                                             update_rule_sequence_batch(batch_payload)
 
-                                        actor_role = str(user.get("role", "")).upper()
-                                        actor_level = get_role_approval_level(actor_role)
-                                        actor_user_id = user.get("user_id")
+                                    actor_role = str(user.get("role", "")).upper()
+                                    actor_level = get_role_approval_level(actor_role)
+                                    actor_user_id = user.get("user_id")
 
-                                        for level in [1, 2, 3]:
-                                            if level <= actor_level:
-                                                step_action = "APPROVED"
-                                                step_comment = f"Auto-approved at Level {level} by {actor_role} during rule save."
-                                                step_user_id = actor_user_id
-                                            elif level == actor_level + 1:
-                                                step_action = "PENDING"
-                                                step_comment = f"Awaiting Level {level} review."
-                                                step_user_id = None
-                                            else:
-                                                step_action = "WAITING"
-                                                step_comment = "Waiting for prior level approval."
-                                                step_user_id = None
-
-                                            upsert_rule_approval_step(
-                                                final_insert_id,
-                                                level,
-                                                step_action,
-                                                step_comment,
-                                                step_user_id,
-                                                now,
-                                            )
-
-                                        if actor_level >= 3:
-                                            run_update(
-                                                f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow "
-                                                f"SET status = 'ACTIVE', updated_at = CAST('{now}' AS TIMESTAMP) "
-                                                f"WHERE rule_id = {final_insert_id}"
-                                            )
-
-                                            can_execute_group = True
-                                            if st.session_state.active_group_mode != "non_sequential":
-                                                success_copy, copy_msg = create_final_rule_file(r_name)
-                                                if not success_copy:
-                                                    st.error(f"❌ Rule approved to ACTIVE, but final file copy failed: {copy_msg}")
-                                                    st.info(f"📁 Draft script written to: `{dbt_filepath}`")
-                                                    can_execute_group = False
-
-                                            if can_execute_group and check_group_fully_approved(st.session_state.active_group_id):
-                                                success_exec, exec_msg = execute_dbt_group(st.session_state.active_group_name)
-                                                if success_exec:
-                                                    st.success(
-                                                        f"✅ Rule '{r_name}' is ACTIVE. Group fully approved and master model executed."
-                                                    )
-                                                elif can_execute_group:
-                                                    st.error(
-                                                        f"⚠️ Rule is ACTIVE and group is approved, but execution failed: {exec_msg}"
-                                                    )
-                                            elif can_execute_group:
-                                                st.success(
-                                                    f"✅ Rule '{r_name}' is ACTIVE. Waiting for remaining rules in this group before group execution."
-                                                )
-                                        elif actor_level == 0:
-                                            if action_mode == "Create New Rule":
-                                                st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
-                                            else:
-                                                st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
+                                    for level in [1, 2, 3]:
+                                        if level <= actor_level:
+                                            step_action = "APPROVED"
+                                            step_comment = f"Auto-approved at Level {level} by {actor_role} during rule save."
+                                            step_user_id = actor_user_id
+                                        elif level == actor_level + 1:
+                                            step_action = "PENDING"
+                                            step_comment = f"Awaiting Level {level} review."
+                                            step_user_id = None
                                         else:
-                                            next_level = actor_level + 1
-                                            if action_mode == "Create New Rule":
+                                            step_action = "WAITING"
+                                            step_comment = "Waiting for prior level approval."
+                                            step_user_id = None
+
+                                        upsert_rule_approval_step(
+                                            final_insert_id,
+                                            level,
+                                            step_action,
+                                            step_comment,
+                                            step_user_id,
+                                            now,
+                                        )
+
+                                    if actor_level >= 3:
+                                        run_update(
+                                            f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow "
+                                            f"SET status = 'ACTIVE', updated_at = CAST('{now}' AS TIMESTAMP) "
+                                            f"WHERE rule_id = {final_insert_id}"
+                                        )
+
+                                        can_execute_group = True
+                                        if st.session_state.active_group_mode != "non_sequential":
+                                            success_copy, copy_msg = create_final_rule_file(r_name)
+                                            if not success_copy:
+                                                st.error(f"❌ Rule approved to ACTIVE, but final file copy failed: {copy_msg}")
+                                                st.info(f"📁 Draft script written to: `{dbt_filepath}`")
+                                                can_execute_group = False
+
+                                        if can_execute_group and check_group_fully_approved(st.session_state.active_group_id):
+                                            success_exec, exec_msg = execute_dbt_group(st.session_state.active_group_name)
+                                            if success_exec:
                                                 st.success(
-                                                    f"✅ Rule '{r_name}' saved. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                                    f"✅ Rule '{r_name}' is ACTIVE. Group fully approved and master model executed."
                                                 )
-                                            else:
-                                                st.success(
-                                                    f"✅ Rule '{r_name}' updated. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                            elif can_execute_group:
+                                                st.error(
+                                                    f"⚠️ Rule is ACTIVE and group is approved, but execution failed: {exec_msg}"
                                                 )
+                                        elif can_execute_group:
+                                            st.success(
+                                                f"✅ Rule '{r_name}' is ACTIVE. Waiting for remaining rules in this group before group execution."
+                                            )
+                                    elif actor_level == 0:
+                                        if action_mode == "Create New Rule":
+                                            st.success(f"✅ Rule '{r_name}' successfully routed to the Manager!")
+                                        else:
+                                            st.success(f"✅ Rule '{r_name}' updated with the same Rule ID and re-routed for review.")
+                                    else:
+                                        next_level = actor_level + 1
+                                        if action_mode == "Create New Rule":
+                                            st.success(
+                                                f"✅ Rule '{r_name}' saved. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                            )
+                                        else:
+                                            st.success(
+                                                f"✅ Rule '{r_name}' updated. Auto-approved through Level {actor_level}; awaiting Level {next_level}."
+                                            )
 
                                     st.info(f"📁 Draft script written to: `{dbt_filepath}`")
                                 else:
@@ -935,6 +1116,8 @@ def render_create_edit_workspace(role, user, table_schemas, table_names, ctx):
                 st.session_state.loaded_primary_columns = None
                 st.session_state.loaded_cols_joins = None
                 st.session_state.last_selected_rule = None
+                if "rule_remark_text" in st.session_state:
+                    del st.session_state["rule_remark_text"]
                 if "t1" in st.session_state:
                     del st.session_state["t1"]
                 st.rerun()

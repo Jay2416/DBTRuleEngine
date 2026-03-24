@@ -593,6 +593,7 @@ def load_rule_state(rule_name, group_name):
     st.session_state.loaded_cols_joins = state.get("cols_joins", {})
     st.session_state.aggregations = state.get("aggregations", [])
     st.session_state.sequence_order = state.get("sequence_order", 1)
+    st.session_state.rule_remark_text = state.get("rule_remark", "")
     return True
 
 
@@ -889,19 +890,27 @@ def process_approval(approval_id, rule_id, rule_name, level_id, user_id, action,
             return True, "Rule routed forward."
 
         run_update(f"UPDATE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow SET status = 'ACTIVE' WHERE rule_id = {rule_id}")
-        success_copy, copy_msg = create_final_rule_file(rule_name)
-        if success_copy:
-            grp_sql = f"SELECT g.group_id, g.group_name, g.execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id WHERE r.rule_id = {rule_id}"
-            grp_res = run_query(grp_sql)
-            g_id, g_name, _ = grp_res[0]
+        grp_sql = f"SELECT g.group_id, g.group_name, g.execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_workflow r JOIN {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group g ON r.group_id = g.group_id WHERE r.rule_id = {rule_id}"
+        grp_res = run_query(grp_sql)
+        if not grp_res:
+            return False, "Rule is ACTIVE, but group metadata lookup failed."
 
-            if check_group_fully_approved(g_id):
-                generate_group_sql(g_id, g_name)
-                success_exec, exec_msg = execute_dbt_group(g_name)
-                return (True, f"✅ Group Fully Approved! Master group compiled and executed! {exec_msg}") if success_exec else (False, f"⚠️ Master compiled, but execution failed: {exec_msg}")
-            return True, "✅ Rule ACTIVE. Waiting for other rules in the group to be approved before executing the Master group file."
+        g_id, g_name, exec_mode = grp_res[0]
 
-        return False, f"❌ Rule ACTIVE, but file copy failed: {copy_msg}"
+        if str(exec_mode).lower() != 'non_sequential':
+            success_copy, copy_msg = create_final_rule_file(rule_name)
+            if not success_copy:
+                return False, f"❌ Rule ACTIVE, but file copy failed: {copy_msg}"
+
+        if check_group_fully_approved(g_id):
+            success_gen, gen_msg = generate_group_sql(g_id, g_name)
+            if not success_gen:
+                return False, f"⚠️ Group approved, but SQL generation failed: {gen_msg}"
+
+            success_exec, exec_msg = execute_dbt_group(g_name)
+            return (True, f"✅ Group Fully Approved! Master group compiled and executed! {exec_msg}") if success_exec else (False, f"⚠️ Master compiled, but execution failed: {exec_msg}")
+
+        return True, "✅ Rule ACTIVE. Waiting for other rules in the group to be approved before executing the Master group file."
 
     return True, "Processed."
 
@@ -989,6 +998,54 @@ def get_all_groups():
     sql = f"SELECT group_id, group_name, execution_mode FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group ORDER BY group_name ASC"
     result = run_query(sql)
     return result if result else []
+
+
+@st.cache_data(ttl=300)
+def get_rule_group_columns():
+    """Return available columns in rule_group to support backward-compatible reads/writes."""
+    rows = run_query(f"DESCRIBE {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group")
+    if not rows:
+        return []
+    cols = []
+    for row in rows:
+        col_name = str(row[0]).strip() if row and row[0] is not None else ""
+        if not col_name or col_name.startswith("#"):
+            continue
+        cols.append(col_name)
+    return cols
+
+
+def get_rule_group_non_seq_config(group_id):
+    """Fetch execution mode plus key/remark metadata from rule_group."""
+    cols = set(get_rule_group_columns())
+    if not cols:
+        return None
+
+    remark_col = "remark" if "remark" in cols else "target_column"
+    select_cols = ["execution_mode", "key_column"]
+    if remark_col in cols:
+        select_cols.append(remark_col)
+
+    sql = (
+        f"SELECT {', '.join(select_cols)} "
+        f"FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group "
+        f"WHERE group_id = {int(group_id)}"
+    )
+    rows = run_query(sql)
+    if not rows:
+        return None
+
+    row = rows[0]
+    exec_mode = row[0] if len(row) > 0 else None
+    key_col = row[1] if len(row) > 1 else None
+    remark_val = row[2] if len(row) > 2 else "remark"
+
+    return {
+        "execution_mode": exec_mode,
+        "key_column": key_col,
+        "remark_column": remark_val or "remark",
+        "remark_field": remark_col,
+    }
 
 def get_next_group_id():
     """Fetches the highest group_id from the database and adds 1."""
@@ -1227,15 +1284,14 @@ def generate_group_sql(group_id, group_name):
     if not rules:
         return False, "No rules found in group."
         
-    # 2. Fetch group details including our new non-sequential fields
-    grp_sql = f"SELECT execution_mode, key_column, target_column FROM {AUTH_CATALOG}.{AUTH_SCHEMA}.rule_group WHERE group_id = {group_id}"
-    grp_res = run_query(grp_sql)
-    if not grp_res:
+    # 2. Fetch group details including non-sequential fields
+    grp_cfg = get_rule_group_non_seq_config(group_id)
+    if not grp_cfg:
         return False, "Group configuration not found."
 
-    exec_mode = grp_res[0][0]
-    key_column = grp_res[0][1]
-    target_column = grp_res[0][2]
+    exec_mode = grp_cfg["execution_mode"]
+    key_column = grp_cfg["key_column"]
+    remark_column = grp_cfg["remark_column"]
 
     def normalize_column_token(col_name):
         """Strip qualifiers/quotes so macro receives a raw output column name."""
@@ -1247,9 +1303,9 @@ def generate_group_sql(group_id, group_name):
         return token
 
     key_column = normalize_column_token(key_column)
-    target_column = normalize_column_token(target_column)
-    if not key_column or not target_column:
-        return False, "Group key/target columns are required for non-sequential execution."
+    remark_column = normalize_column_token(remark_column)
+    if not key_column or not remark_column:
+        return False, "Group key/remark columns are required for non-sequential execution."
     
     safe_group = re.sub(r'[^a-zA-Z0-9_]', '_', group_name.lower())
     
@@ -1269,7 +1325,7 @@ def generate_group_sql(group_id, group_name):
 {{{{ non_sequential_rule_engine(
     rule_models={rule_models},
     key_column='{key_column}',
-    target_column='{target_column}'
+    remark_column='{remark_column}'
 ) }}}}"""
 
     # ==========================================
@@ -1477,12 +1533,6 @@ else:
         st.markdown("### 🔀 DBT Rule Engine")
         st.caption("Query Builder Environment")
         st.divider()
-        st.markdown("📂 Data Sources")
-        st.markdown("🔖 Saved Rules")
-        st.markdown("**🔗 Query Builder**") # Highlighted current page
-        st.markdown("📈 Risk Analytics")
-        st.markdown("⚙️ Settings")
-        st.divider()
         st.header(f"👤 {user['firstname']} {user['lastname']}")
         st.caption(f"Role: {user['role']}")
         if st.button("🚪 Logout", use_container_width=True):
@@ -1648,6 +1698,8 @@ else:
                 "check_group_fully_approved": check_group_fully_approved,
                 "execute_dbt_group": execute_dbt_group,
                 "_clear_dynamic_widget_keys": _clear_dynamic_widget_keys,
+                "get_rule_group_columns": get_rule_group_columns,
+                "get_rule_group_non_seq_config": get_rule_group_non_seq_config,
             },
         )
         st.stop()

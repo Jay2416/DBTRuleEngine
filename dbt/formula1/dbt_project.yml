@@ -39,6 +39,10 @@ models:
       +schema: staging
     rules:
       +schema: rules
+      driver_test:
+        +schema: driver_test
+      testing_ns:
+        +schema: testing_ns
       test_group:
         +schema: test_group
       front_grid_starters:
